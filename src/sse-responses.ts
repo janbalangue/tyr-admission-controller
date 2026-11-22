@@ -7,6 +7,10 @@
  * event containing either `response.usage` or top-level `usage` with numeric
  * `input_tokens` / `output_tokens`, ignores unknown/malformed events, and never
  * changes proxied bytes.
+ *
+ * Lifecycle events also carry the response object itself. The optional
+ * `onResponse` callback receives each one with its event type, so a caller
+ * that keeps response memory can record a finished response's id and size.
  */
 import type { UsageObservation } from "./sse.js";
 
@@ -30,6 +34,7 @@ function usageFrom(value: unknown): UsageObservation | undefined {
 
 export function createOpenAIResponsesSSEUsageExtractor(
   onUsage: (usage: UsageObservation) => void,
+  onResponse?: (response: Record<string, unknown>, eventType: unknown) => void,
 ) {
   let buffer = "";
   let currentUsage: UsageObservation | undefined;
@@ -45,11 +50,13 @@ export function createOpenAIResponsesSSEUsageExtractor(
     if (parsed === null || typeof parsed !== "object") return;
     const event = parsed as Record<string, unknown>;
     const response = event["response"];
-    const responseUsage =
-      response !== null && typeof response === "object"
-        ? (response as Record<string, unknown>)["usage"]
+    const responseObject =
+      response !== null && typeof response === "object" && !Array.isArray(response)
+        ? (response as Record<string, unknown>)
         : undefined;
-    const observed = usageFrom(responseUsage) ?? usageFrom(event["usage"]);
+    if (responseObject !== undefined) onResponse?.(responseObject, event["type"]);
+    const observed =
+      usageFrom(responseObject?.["usage"]) ?? usageFrom(event["usage"]);
     if (observed === undefined) return;
     currentUsage = observed;
     onUsage(observed);

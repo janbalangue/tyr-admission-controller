@@ -2,8 +2,8 @@
 
 Tyr is an LLM admission controller. Its purpose is to prevent concurrent AI workloads from overcommitting finite provider or inference capacity by reserving token capacity before upstream execution begins.
 
-This roadmap prioritizes the shortest path from the current `v0.33.0`
-self-serve evaluation release to a commercially credible product. It
+This roadmap prioritizes the shortest path from the current `v0.34.0`
+response-memory release to a commercially credible product. It
 assumes one experienced TypeScript/backend engineer, automated tests and
 documentation for every milestone, and no custom management UI before
 `v1.0.0`.
@@ -25,10 +25,16 @@ The initial commercial promise is:
 5. **Control cardinality.** Tenant, application, model, and request identifiers must not create unbounded metric labels or bulkhead instances.
 6. **Preserve a small data plane.** Authentication, admission, forwarding, and telemetry belong in the gateway; historical analytics and fleet coordination may live outside it.
 
-## Current baseline: v0.33.0
+## Current baseline: v0.34.0
 
 The current release provides:
 
+- Opt-in response memory for OpenAI Responses follow-ups: Tyr records the
+  provider-reported size of each Responses reply, a `previous_response_id`
+  follow-up reserves its own estimate plus that size, and a follow-up to a
+  response Tyr has no record of is refused before the provider is called.
+  Records are bounded, survive a restart, and belong to the tenant and
+  application that created them.
 - A self-serve evaluation path: `npm run eval` shows interactive traffic
   protected from a batch flood on a capacity-limited mock provider, and
   `npm run eval:serve` plus the OpenAI SDK quickstarts need no Kubernetes,
@@ -38,7 +44,7 @@ The current release provides:
 - Upstream failure diagnostics: `502 upstream_error` names a bounded transport
   `cause.code`, counted by `tyr_upstream_failures_total` and logged as a
   `tyr.diagnostic.v1` event.
-- Anthropic Messages, OpenAI Chat Completions, and stateless OpenAI Responses proxy routes.
+- Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses proxy routes.
 - Model-prefix routing to independently configured local pools.
 - A v3.17 pool policy runtime using exact reservation previews, native observe
   mode, and complete versioned admission-limit snapshots.
@@ -508,6 +514,21 @@ Outcome:
 - Tyr keeps its pre-upstream token-reservation guarantee explicit rather than
   pretending unseen provider-managed state can be estimated safely.
 
+### v0.34.0 — Response memory for Responses follow-ups — shipped 2026-11-22
+
+- Added opt-in `responsesState`. Tyr records the provider-reported size of each Responses reply, and a `previous_response_id` follow-up reserves its own estimate plus that size.
+- A follow-up to a response Tyr has no usable record of is refused with `422 unknown_previous_response` before the provider is called.
+- Records are bounded by count and age, survive a killed process through an append-only state file, and belong to the tenant and application that created them.
+- The recorded size is added to the reservation exactly, outside adaptive correction, and follow-ups are left out of calibration.
+- Added per-pool `/stats` counters, Prometheus series, audit attribution for the earlier tokens, and `verify:responses-state` in `release:check`.
+
+Outcome:
+
+- Applications that chain Responses calls with `previous_response_id` can run behind Tyr without resending the conversation, and Tyr still reserves the tokens the provider will count.
+- The 0.29.0 boundary holds for hidden state: Tyr admits what it can size and refuses the rest explicitly.
+
+Not in this release: background responses, server-side conversations, and sharing records between replicas.
+
 ### v0.33.0 — Self-serve evaluation path — shipped 2026-09-23
 
 - `npm run eval` sends the same interactive-plus-batch-flood workload straight to a capacity-limited mock OpenAI provider and then through Tyr, and reports both. Admission classes are selected from a local evaluation JWT issuer. No API key, Docker, Kubernetes, or Latchflo.
@@ -552,7 +573,7 @@ Outcome:
 
 ### v1.0.0 — Supported production release
 
-**Timing:** After v0.33.0 and sufficient design-partner validation.
+**Timing:** After v0.34.0 and sufficient design-partner validation.
 **Goal:** Provide a stable, documented, supportable product for production design partners.
 
 Planned work:

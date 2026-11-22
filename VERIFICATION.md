@@ -1,11 +1,11 @@
-# Tyr 0.33.0 verification
+# Tyr 0.34.0 verification
 
-Date: 2026-09-23
+Date: 2026-11-22
 
 ## Version alignment
 
-- Tyr package version: `0.33.0`
-- Runtime version constant: `0.33.0`
+- Tyr package version: `0.34.0`
+- Runtime version constant: `0.34.0`
 - Runtime dependency: `async-bulkhead-llm@3.17.0`
 - Transitive bulkhead dependency: `async-bulkhead-ts@1.0.1`
 - Vendored runtime artifacts:
@@ -16,11 +16,103 @@ Date: 2026-09-23
 
 ## Required release order
 
-`async-bulkhead-llm@3.17.0` was published for Tyr 0.30.0; 0.33.0 uses the same
-release. Tyr's committed lockfile intentionally resolves the exact bundled
+`async-bulkhead-llm@3.17.0` was published for Tyr 0.30.0; 0.34.0 uses the same
+release. `async-bulkhead-llm@3.17.1` restructures the library internally and
+changes no API or behavior, so 0.34.0 does not adopt it and changes Tyr's own
+code only. Tyr's committed lockfile intentionally resolves the exact bundled
 `vendor/async-bulkhead-llm-3.17.0.tgz`, so the Tyr build is reproducible while
 the dependency release is staged; the vendor artifact is not a substitute for
 publishing the declared public package version.
+
+## Response memory (0.34.0)
+
+`npm run verify:responses-state` runs against the built `dist/` and a stand-in
+provider that reports 20 input and 30 output tokens for every reply. With a
+pool that has `maxConcurrent: 4`, a 5,000-token budget and adaptive estimation
+off, the request `{ model: "gpt-4o", input: "hello", max_output_tokens: 100 }`
+reserves 111 tokens. The script passes only if:
+
+- without `responsesState`, a follow-up gets `400 invalid_request` and
+  `/stats` has no `tyr.responsesState`;
+- a follow-up to a recorded response gets `200` with
+  `x-admission-reserved-tokens: 161` and `x-admission-prior-tokens: 50`, and
+  the pool's `totalReserved` is 111 + 161;
+- a follow-up to an unknown id gets `422 unknown_previous_response`, the
+  provider's call count does not change, and the pool's `llm.rejected` stays 0;
+- a reply to a `store: false` request and a reply without usage are not
+  recorded;
+- a streamed reply is recorded from its `response.completed` event;
+- with `maxEntries: 2`, the first of three responses is unknown and the third
+  is known; with `ttlMs: 200`, a follow-up 600 ms later is unknown;
+- with identity, a follow-up from the same tenant and application under
+  another subject is admitted, and one from another tenant or application
+  gets the same body as an unknown id without a provider call;
+- the built server, started with `TYR_CONFIG_FILE` and a relative
+  `responsesState.file`, has the record on disk when the reply arrives, is
+  killed with `SIGKILL`, is started again, and then admits the follow-up with
+  161 reserved tokens. `SIGTERM` afterward exits with code 0.
+
+The Vitest suite adds 74 tests in three files. Beyond the cases above they
+cover:
+
+- the recorded size added exactly on top of an adaptively corrected estimate,
+  with the pool's calibration samples unchanged by the follow-up;
+- a follow-up admitted while the first reply's stream is still open, which
+  shows the record exists before the reply ends;
+- a stream that reports usage on its first event and then breaks off, which
+  leaves no record;
+- a `429 budget_limit` follow-up that still reports its prior tokens;
+- a state file with a partly written last line, unreadable lines, a line
+  longer than any Tyr writes, a foreign file, a newer schema, records that
+  span read boundaries, and bounds changed between runs;
+- a write that fails partway through a line: nothing is appended after the
+  fragment, and the next rewrite saves every record, including the one whose
+  write failed;
+- a rewrite that keeps failing: appends stop, the retry delay doubles, and
+  the file is restored with its header once the directory is back;
+- a start on a readable file that cannot be rewritten, which serves the
+  records it read, and a start that cannot create the file, which fails;
+- capacity routing: a `store: false` request is forwarded to a peer with more
+  headroom, while a request whose reply will be recorded, and its follow-up,
+  are admitted on the replica that received them.
+
+Each of these guarantees was also checked by breaking it on purpose and
+confirming a test failed: follow-ups used as calibration samples, the recorded
+size passed through the estimator, a streamed record written after its final
+event was forwarded, usage accepted from a stream event that is not final,
+appending after a failed write, record-bound requests forwarded by capacity
+routing, and the owner check removed.
+
+A second-pass review of the first version of this change found four defects
+in the store, all fixed here: eviction and loading took time quadratic in
+`maxEntries`, a failed append could corrupt the next record, a rewrite that
+kept failing let the file grow without bound, and usage on a stream event
+that was not final could create an undersized record. Eight of the tests
+above fail against that first version.
+
+The 199 tests from 0.33.0 pass with one edit, the version in the
+`tyr_build_info` assertion. No other existing test or verify script changed.
+
+With `responsesState` absent, this build was also compared with a build of the
+0.33.0 tag. Both received the same nine requests: two plain Responses calls,
+one of them streamed, a `previous_response_id` follow-up, a `null`
+`previous_response_id`, `store: false`, `conversation`, `background: true`, a
+Chat Completions call, and an unrouted model. The statuses, `x-admission-*`
+headers and bodies, the `/stats` document, and all 236 `/metrics` lines were
+identical once admission ids, timestamps, duration samples and the version
+label were masked.
+
+On the development Mac, writing 100,000 records with `maxEntries: 10000` took
+0.007 ms per record on average and 0.01 ms at the 99th percentile. The slowest
+write, 17 ms, was a rewrite of the state file, which happens once per 10,000
+or more records at that setting. Loading the resulting 3 MB file at startup
+took 36 ms. At the largest allowed setting, `maxEntries: 1000000`, writing
+2,100,000 records took 0.006 ms each on average, the one rewrite took 0.49
+seconds, loading the 174 MB file took 1.8 seconds, and the records used about
+240 MB of heap.
+
+Not verified: a run against the live OpenAI API, the state file on a mounted
+volume in the container image, and more than two replicas.
 
 ## Self-serve evaluation (0.33.0)
 
@@ -162,8 +254,9 @@ still has no synchronous control-plane call.
 
 ## Carried-forward compatibility
 
-Tyr 0.33.0 retains the native Anthropic Messages, OpenAI Chat Completions, and
-stateless OpenAI Responses routes from 0.29.0. Existing identity, routing,
+Tyr 0.34.0 retains the native Anthropic Messages, OpenAI Chat Completions, and
+OpenAI Responses routes from 0.29.0. Responses requests stay stateless unless
+`responsesState` is configured. Existing identity, routing,
 managed-mode, provenance, timing, retry-hint, and progressive-reconciliation
 paths remain intact. Classes without `borrowedAdmissionSlot` keep the existing
 non-preemptive drain behavior.
@@ -179,7 +272,7 @@ npm run release:check
 
 The release gate verifies vendored tarball integrity, lint, TypeScript, the full
 Vitest suite, all executable integration verifiers (including borrowed
-restoration), smoke imports, and `npm pack --dry-run`.
+restoration and response state), smoke imports, and `npm pack --dry-run`.
 
 For independent configuration checks:
 
@@ -193,15 +286,21 @@ git diff --check
 
 ## Recorded results
 
-The full release gate passed in this review environment on 2026-09-03:
+The full release gate passed on the development Mac on 2026-11-22, on Node.js
+24.18.0, in about 45 seconds:
 
-- 13 Vitest files passed, containing 194 tests;
-- every executable verifier passed, including the six borrowed-restoration
-  assertions;
+- 17 Vitest files passed, containing 273 tests;
+- every executable verifier passed, including the seven borrowed-restoration
+  assertions and `verify:responses-state`;
 - both shipped YAML examples passed runtime CLI validation;
 - telemetry smoke and `git diff --check` passed;
-- `npm pack --dry-run` included 48 files, approximately 148.6 kB packed and
-  613.0 kB unpacked.
+- `npm pack --dry-run` included 53 files, approximately 162.3 kB packed and
+  678.1 kB unpacked.
+
+`npm run verify:vendor-provenance` also passed: the three vendored artifacts
+match their published releases. The Vitest suite and
+`scripts/verify-responses-state.mjs` also passed locally on Node.js 20.20.0
+and 22.23.1, with 273 tests on each. CI was not run for this record.
 
 The final ZIP is checked from a fresh extraction before delivery. It excludes
 platform-specific `node_modules`; consumers install the locked development

@@ -12,7 +12,7 @@ Tyr runs on its own. Latchflo, a separately licensed control plane, can
 coordinate one capacity envelope across many Tyr replicas; see
 [Latchflo managed mode](#latchflo-managed-mode).
 
-> **Status:** v0.33.0, pre-1.0, licensed under Apache-2.0 (see
+> **Status:** v0.34.0, pre-1.0, licensed under Apache-2.0 (see
 > [`LICENSE.txt`](LICENSE.txt)). Built on
 > [`async-bulkhead-llm@3.17.0`](https://www.npmjs.com/package/async-bulkhead-llm).
 
@@ -96,16 +96,21 @@ For each provider request, Tyr:
 2. Buffers and validates the JSON body within the configured size limit.
 3. Routes the model to the longest matching pool prefix and projects provider
    prompt content into an admission request.
-4. Computes one immutable reservation preview.
-5. When capacity-aware routing is enabled, compares the local grant partition
+4. With [response memory](#response-memory-for-responses-follow-ups)
+   configured, resolves a Responses follow-up to the recorded size of the
+   response it names, or refuses it.
+5. Computes one immutable reservation preview.
+6. When capacity-aware routing is enabled, compares the local grant partition
    with fresh peer snapshots and may forward the request once to a roomier Tyr.
-6. The serving Tyr captures its complete versioned limit snapshot, computes its
+   A request bound to a response record is admitted where it arrived.
+7. The serving Tyr captures its complete versioned limit snapshot, computes its
    own authoritative reservation, and calls the native v3.15 `run()` path in
    the configured `enforce` or `observe` mode.
-7. Reconciles live and final provider usage. Budgeted streams progressively
+8. Reconciles live and final provider usage. Budgeted streams progressively
    return processed capacity when cumulative usage is available; native observe
-   bypass releases also feed adaptive estimation.
-8. Releases remaining capacity when the request completes, fails, or the client
+   bypass releases also feed adaptive estimation. With response memory
+   configured, the size of a Responses reply is recorded before the reply ends.
+9. Releases remaining capacity when the request completes, fails, or the client
    disconnects.
 
 Tyr does not translate between Anthropic and OpenAI request formats.
@@ -272,7 +277,9 @@ by the calling application and must not be placed in Tyr configuration files.
 
 ### Admission response headers
 
-Every validated, pool-routed request includes an advisory snapshot:
+Every validated, pool-routed request includes an advisory snapshot. The one
+exception is a follow-up refused as `unknown_previous_response`, which has no
+reservation to preview:
 
 | Header | Meaning |
 |---|---|
@@ -282,6 +289,7 @@ Every validated, pool-routed request includes an advisory snapshot:
 | `x-admission-preview-revision` | Limit revision used for the advisory preview |
 | `x-admission-preview-reason` | Present when the advisory result rejects |
 | `x-admission-reserved-tokens` | Exact input-plus-output reservation when a token budget exists |
+| `x-admission-prior-tokens` | Recorded size of the earlier response a Responses follow-up names; included in `x-admission-reserved-tokens` when the pool has a token budget. Present only on a follow-up when [response memory](#response-memory-for-responses-follow-ups) is configured |
 | `x-admission-id` | Bulkhead UUID, or `shadow-...` for an observe-mode bypass |
 | `x-admission-outcome` | `admitted` or native v3.12 `bypassed` outcome |
 | `x-admission-revision` | Revision active when execution began; immediate rejections use the preview revision |
@@ -332,6 +340,7 @@ admission, and a retry hint is an estimate rather than a reservation.
 | `404` | `not_found`, `route_not_configured`, `routing_not_configured`, or `metrics_disabled` | The route is unknown, its upstream or replica routing is disabled, or metrics exposition is disabled. |
 | `413` | `payload_too_large` | The request body exceeds `server.maxRequestBodyBytes`. |
 | `422` | `unsupported_model` | No configured pool matches the requested model. |
+| `422` | `unknown_previous_response` | With response memory configured, the request names a `previous_response_id` that Tyr has no usable record of. The provider was not called. Do not retry unchanged; resend the earlier turns in the request instead. |
 | `429` | `admission_rejected`, commonly `budget_limit` or `concurrency_limit` | Tyr is protecting bounded capacity; honor `x-admission-retry-after-ms` when present, otherwise retry with backoff or reduce demand. |
 | `500` | `internal` | Tyr encountered an unexpected internal failure; retry according to the caller's server-error policy. |
 | `502` | `upstream_error` or `routing_peer_unavailable` | The provider or selected Tyr peer failed before a valid response was returned. `upstream_error` carries `cause.code` (for example `ECONNREFUSED` or `UND_ERR_SOCKET`) when the transport reported one. A routed request is not automatically replayed. |
@@ -387,12 +396,13 @@ curl -i http://127.0.0.1:8787/v1/responses \
   }'
 ```
 
-Tyr 0.33.0 supports stateless synchronous and streaming Responses requests. To
-keep pre-admission token reservations bounded from request-visible state, it
-rejects `previous_response_id`, server-side `conversation`, stored `prompt`
-templates, `item_reference`, `background: true`, and provider-managed
-retrieval/computer tools. Request-visible `function` and `custom` tools are
-supported.
+Tyr 0.34.0 supports synchronous and streaming Responses requests. To keep
+pre-admission token reservations bounded, it rejects server-side
+`conversation`, stored `prompt` templates, `item_reference`,
+`background: true`, and provider-managed retrieval/computer tools.
+Request-visible `function` and `custom` tools are supported.
+`previous_response_id` is rejected too unless
+[response memory](#response-memory-for-responses-follow-ups) is configured.
 
 For OpenAI Chat Completions streaming requests, set
 `stream_options: { "include_usage": true }` when supported so Tyr can reconcile
@@ -447,6 +457,104 @@ remain conservative automatically. The repository lockfile resolves the bundled
 `vendor/async-bulkhead-llm-3.17.0.tgz` and
 `vendor/async-bulkhead-ts-1.0.1.tgz`, so the release can be built before those
 artifacts are fetched from a public registry.
+
+## Response memory for Responses follow-ups
+
+A Responses request that names `previous_response_id` carries none of the
+earlier turns in its body, so its input cannot be estimated from the request
+alone. By default Tyr rejects it. With `responsesState` configured, Tyr
+records the size of each Responses reply it proxies, and a follow-up reserves
+its own estimate plus the recorded size of the response it names.
+
+```yaml
+responsesState:
+  file: /var/lib/tyr/responses-state.jsonl
+  maxEntries: 10000   # default; the oldest record is dropped first
+  ttlMs: 2592000000   # default, 30 days
+```
+
+- A `2xx` Responses reply that carries an `id` and provider `usage` is
+  recorded as `input_tokens + output_tokens`. A request with `store: false`,
+  a reply without usage, and a reply with any other HTTP status are not
+  recorded.
+- A streamed reply is recorded only from an event that shows the response is
+  finished: one whose response has the status `completed`, `incomplete`,
+  `failed` or `cancelled`, or, when the response has no status, a
+  `response.completed`, `response.incomplete` or `response.failed` event.
+  Usage on any earlier event is ignored, so a stream that breaks off leaves
+  no undersized record.
+- A follow-up to a recorded response reserves its own estimate plus the
+  recorded size. `x-admission-prior-tokens` reports that size, and
+  `x-admission-reserved-tokens` includes it when the pool has a token budget.
+  The recorded size is an amount the provider reported, so adaptive
+  estimation does not scale it, and follow-ups are not used as calibration
+  samples.
+- A follow-up that names a response Tyr has no usable record of gets `422`
+  with `error.type: "unknown_previous_response"`. The provider is not called,
+  and no retry hint is sent because waiting cannot help. The refusal carries
+  `x-admission-mode`, `x-admission-revision` and
+  `x-admission-reason: unknown_previous_response`, but no preview or
+  reservation headers. `observe` mode does not shadow it.
+- Tyr keeps at most `maxEntries` records, drops the oldest first, and drops
+  each record `ttlMs` after it was written.
+- Each record is appended to `file` before its reply ends, so a process killed
+  right after a reply keeps it. Tyr reads the file at startup, before it
+  serves requests, and ignores a partly written last line. It refuses to start
+  on a file that is not a Tyr state file or that a newer Tyr wrote, and when
+  it cannot read the file or create a missing one.
+- With identity configured, a record belongs to the tenant and application
+  that created it. A follow-up from anyone else gets the same `422` as an
+  unknown id.
+
+`GET /stats` exposes per-pool counters in `tyr.responsesState`: `records`,
+`recorded`, `evicted`, `expired`, `followUps`, `priorTokens`, `refused`, and
+`persistFailures`. `/metrics` exposes the same values as
+`tyr_pool_responses_state_*`. A refusal is also a rejected admission decision:
+it counts in `tyr_admission_decisions_total`, in
+`tyr_admission_rejections_total` with `reason="unknown_previous_response"`,
+and in `tyr_requests_total` as `admission_rejected`, and it emits an admission
+audit event when auditing is on. It never reaches the pool, so it does not
+appear in `tyr_pool_rejected_total`.
+
+Operating notes:
+
+- Response memory is configured in a configuration file or through
+  `createGateway`. Legacy environment mode has no variable for it.
+- The state file is created with mode `0600`. A relative `file` is resolved
+  from the configuration file's directory. Every Tyr process needs its own
+  file.
+- Tyr replaces the state file by writing a temporary file next to it and
+  renaming it. The directory that holds `file` must therefore be writable;
+  mounting only the file is not enough.
+- In a container, put `file` in a writable mounted directory that the image's
+  `node` user can write. The read-only configuration mount shown under
+  [Container usage](#container-usage) is not writable.
+- `maxEntries` is one bound for every caller. A caller that creates that many
+  responses displaces all older records, including other tenants'. Size it
+  for the whole deployment.
+- A record takes roughly 250 bytes of memory. After about `maxEntries` new
+  records Tyr rewrites the file, which blocks the process for roughly 20 ms
+  at 10,000 records and half a second at 1,000,000 on an SSD.
+- Records are local to one process. With several replicas, a follow-up is
+  admitted only on the replica that recorded the response it names, so keep a
+  conversation on one replica.
+- With capacity routing on, Tyr admits a Responses request on the replica that
+  received it when the request names a record or its reply will be recorded.
+  A `store: false` request without `previous_response_id` is still routed by
+  capacity.
+- When a write to the state file fails, Tyr logs one warning and stops
+  appending, because the file may end in part of a line. Records stay usable
+  in memory, and each one that is not on disk increases `persistFailures`.
+  On the first new record after 1 second, Tyr retries a full rewrite; each
+  failure doubles the wait, up to 5 minutes. A successful rewrite puts every
+  record it still holds on disk. The same applies when a rewrite at startup
+  fails: Tyr starts with the records it read.
+- A record survives a killed Tyr process. Appends are not followed by `fsync`,
+  so a host crash can lose the newest records; their follow-ups are then
+  refused as unknown.
+- The recorded size is the earlier reply's input plus output tokens. When the
+  provider carries less than that into the next turn, the difference is
+  refunded at settlement like any other over-reservation.
 
 ## Configuration schema
 
@@ -579,6 +687,14 @@ pools:
 | `routing.capacityAware.forwardTimeoutMs` | No | Deadline for a routed peer to return response headers; default `30000` |
 | `telemetry.metrics.enabled` | No | Expose Prometheus text at `/metrics`; default `true` |
 | `telemetry.audit.enabled` | No | Emit one structured JSON line per admission decision; default `false` |
+| `retryHint.enabled` | No | Send retry hints on capacity rejections; default `true` |
+| `retryHint.minMs` | No | Smallest hint Tyr sends; default `50` |
+| `retryHint.maxMs` | No | Largest hint Tyr sends; default `30000` |
+| `retryHint.halfLifeMs` | No | Half-life of the observed-completion average; default `5000` |
+| `retryHint.minSamples` | No | Completions a pool needs before it sends a hint; default `3` |
+| `responsesState.file` | Response memory only | State file for recorded Responses replies; created when missing, relative to the configuration file's directory |
+| `responsesState.maxEntries` | No | Most records kept at once, from `1` through `1000000`; default `10000` |
+| `responsesState.ttlMs` | No | Milliseconds a record stays usable; default `2592000000` (30 days) |
 | `pools[].name` | Yes | Unique pool name used in stats and rejection details |
 | `pools[].modelPrefixes` | Yes | Unique prefixes; longest matching prefix wins |
 | `pools[].estimatorModel` | Yes | Model used for estimator ratios; requests are not rewritten |
@@ -701,7 +817,7 @@ tyr validate --config ./deploy/tyr.yaml
 Build the included image:
 
 ```bash
-docker build -t tyr-admission-controller:0.33.0 .
+docker build -t tyr-admission-controller:0.34.0 .
 ```
 
 The source tree must include the committed `vendor/` directory. Run `npm run verify:vendor` before building or publishing a source archive.
@@ -715,8 +831,11 @@ docker run --rm \
   -p 127.0.0.1:8787:8787 \
   -e TYR_CONFIG_FILE=/etc/tyr/config.yaml \
   -v "$PWD/tyr.yaml:/etc/tyr/config.yaml:ro" \
-  tyr-admission-controller:0.33.0
+  tyr-admission-controller:0.34.0
 ```
+
+A configuration that uses `responsesState` also needs a writable mount for the
+state file, because the configuration mount above is read-only.
 
 Or use the included Compose example:
 
@@ -844,7 +963,7 @@ pool name, configured admission-class ID, provider shape, priority, status
 class, outcome, and enumerated reason. Model strings, request IDs, admission
 IDs, grant IDs, and tenant-supplied identity values never become metric labels.
 
-Tyr 0.33.0 carries forward two admission-path histograms.
+Tyr 0.34.0 carries forward two admission-path histograms.
 `tyr_admission_decision_seconds` measures synchronous local decision work and
 **excludes** the awaited local concurrency acquire.
 `tyr_admission_queue_wait_seconds` measures that acquire wait separately. Both
@@ -918,10 +1037,16 @@ is logged but never returned to the caller.
 - Upstream response headers are not generally passed through; Tyr returns the
   upstream status and body with a normalized content type.
 - There is no Anthropic/OpenAI format translation.
-- Responses support is intentionally stateless in v0.33.0: hidden server-side
-  conversation/prompt references, background execution, and provider-managed
-  retrieval/computer tools are rejected until Tyr can reserve their capacity
-  without undercounting unseen state.
+- Response memory is per process in v0.34.0. A `previous_response_id`
+  follow-up is admitted only on the replica that recorded the response it
+  names, and capacity routing does not forward Responses requests that create
+  or use a record. A response deleted at the provider keeps its record until
+  `ttlMs`; its follow-up is reserved, sent, and then rejected by the provider.
+  `maxEntries` is shared by all callers and is not divided between tenants.
+- Server-side `conversation` and stored `prompt` references, `item_reference`,
+  background execution, and provider-managed retrieval/computer tools are
+  rejected until Tyr can reserve their capacity without undercounting unseen
+  state.
 - There is no active-stream termination policy for post-admission usage
   overruns.
 - Multi-controller Latchflo failover, tenant policy, and supported Helm packaging
@@ -1047,7 +1172,7 @@ controlPlane:
   metadata:
     region: us-west
     zone: us-west-2a
-    version: 0.33.0
+    version: 0.34.0
     endpoint: http://tyr-a:8787
     labels:
       environment: demo
@@ -1077,7 +1202,7 @@ bounded by `requestTimeoutMs`.
 ### Demand-aware Latchflo heartbeats
 
 Tyr automatically derives one snapshot per managed pool from its existing
-statistics. Tyr 0.33.0 carries forward bounded per-class demand in that additive
+statistics. Tyr 0.34.0 carries forward bounded per-class demand in that additive
 heartbeat while preserving the original pool-level fields:
 
 ```json
@@ -1132,7 +1257,7 @@ identity values never become heartbeat keys. `protected*` and `borrowed*` fields
 report current use of the active floor and shared remainder. They are telemetry,
 not a request for Tyr to resize its own limits.
 
-Tyr 0.33.0 advertises `admissionClassDemand: true`,
+Tyr 0.34.0 advertises `admissionClassDemand: true`,
 `grantOccupancyAck: true`, `admissionClassOccupancyAck: true`, and the additive
 `borrowedAdmissionSlotDeadlines: true` capability at registration. Older control
 planes that ignore unknown capability and nested evidence fields remain
@@ -1165,7 +1290,7 @@ The acknowledgement's `occupancy` object is additive observability evidence;
 Latchflo 0.10.0 does not need to trust it to commit a transfer. The fresh
 post-ack heartbeat remains the authoritative proof used by that control plane.
 
-Tyr 0.33.0 applies the same ordering to restrictive class-only changes. When a
+Tyr 0.34.0 applies the same ordering to restrictive class-only changes. When a
 protected floor is restored, the newly protected capacity reduces the shared
 remainder. Tyr therefore keeps publishing bounded class evidence until the sum
 of `borrowedConcurrent` fits within the desired shared concurrency remainder and,
@@ -1238,6 +1363,7 @@ src/
   demand.ts          accepted-heartbeat demand deltas derived from live pool statistics
   pools.ts          v3.16 policy runtime, progressive reconciliation, versioned limits, observe mode, and drain
   routing.ts        protected peer snapshots and request-specific replica selection
+  responses-state.ts response memory for Responses follow-ups and its state file
   server.ts         HTTP proxy, routing, admission, telemetry, timeouts, and shutdown
   telemetry.ts      Prometheus metrics and structured admission audit events
   sse.ts            Anthropic streaming usage extraction
@@ -1253,6 +1379,9 @@ test/
   routing-gateway.test.ts authenticated one-hop routing integration tests
   latchflo.test.ts  managed-agent, readiness, persistence, and expiration tests
   pools-v311.test.ts v3.11 preview, exact admission provenance, observe, reconfiguration, and drain tests
+  responses-state.test.ts response-memory bounds, ownership, and state-file tests
+  responses-state-gateway.test.ts follow-up admission, refusal, streaming, and restart tests
+  responses-state-config.test.ts responsesState file-configuration and schema tests
 eval/
   run.mjs           self-serve evaluation runner (npm run eval, eval:serve, verify:eval)
   tyr.eval.yaml     single-node evaluation configuration with admission classes
@@ -1325,6 +1454,7 @@ npm run smoke
 npm run verify:routing
 npm run verify:routing-topology
 npm run verify:openai-responses
+npm run verify:responses-state
 npm run verify:borrowed-restoration
 npm run verify:demand
 npm run verify:admission-provenance

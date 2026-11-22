@@ -32,6 +32,16 @@ export type ValidationResult =
   | { ok: true; value: Record<string, unknown> }
   | { ok: false; errors: string[] };
 
+export type AdapterValidationOptions = {
+  maxOutputTokens: number;
+  /**
+   * Accept `previous_response_id` on Responses requests. Set only when the
+   * gateway has response memory, because the caller must then resolve the
+   * named response to a recorded size before admission.
+   */
+  allowPreviousResponseId?: boolean;
+};
+
 export type Adapter = {
   shape: ApiShape;
   /** Route path this adapter serves, e.g. "/v1/messages". */
@@ -45,16 +55,22 @@ export type Adapter = {
    * `isStreamRequested` are trusted with the body; those functions assume
    * a validated shape and use defensive fallbacks only as a last resort.
    */
-  validate(body: unknown, opts: { maxOutputTokens: number }): ValidationResult;
+  validate(body: unknown, opts: AdapterValidationOptions): ValidationResult;
   /** Build the complete token-bearing admission projection. */
   toAdmissionRequest(body: Record<string, unknown>): LLMRequest;
   /** Whether the client requested a streaming response. */
   isStreamRequested(body: Record<string, unknown>): boolean;
   /** Parse actual usage from a complete (non-streaming) JSON response body. */
   parseUsage(json: unknown): TokenUsage | undefined;
-  /** Create an incremental usage extractor for a streaming response body. */
+  /**
+   * Create an incremental usage extractor for a streaming response body.
+   * `onResponse` receives each provider response object the stream carries,
+   * with the type of the event that carried it, on protocols that have one,
+   * before the chunk holding it is forwarded.
+   */
   createStreamExtractor(
     onUsage: (usage: UsageObservation) => void,
+    onResponse?: (response: Record<string, unknown>, eventType: unknown) => void,
   ): StreamExtractor;
 };
 
@@ -401,7 +417,16 @@ export const openaiResponsesAdapter: Adapter = {
         "background=true is not supported because provider execution continues after the HTTP response and cannot retain a bounded admission reservation",
       );
     }
-    if (body["previous_response_id"] !== undefined) {
+    if (opts.allowPreviousResponseId === true) {
+      // `null` is the API's spelling of "no previous response".
+      if (
+        body["previous_response_id"] !== undefined &&
+        body["previous_response_id"] !== null &&
+        !isNonEmptyString(body["previous_response_id"])
+      ) {
+        errors.push("previous_response_id must be a non-empty string");
+      }
+    } else if (body["previous_response_id"] !== undefined) {
       errors.push(
         "previous_response_id is not supported because prior response tokens are hidden at admission time",
       );
@@ -477,7 +502,7 @@ export const openaiResponsesAdapter: Adapter = {
     }
     return undefined;
   },
-  createStreamExtractor(onUsage) {
-    return createOpenAIResponsesSSEUsageExtractor(onUsage);
+  createStreamExtractor(onUsage, onResponse) {
+    return createOpenAIResponsesSSEUsageExtractor(onUsage, onResponse);
   },
 };

@@ -83,6 +83,22 @@ priority:
 #     operator: [tyr.operator]
 #     highPriority: [tyr.priority.high]
 
+# Optional response memory for OpenAI Responses follow-ups. Requires
+# upstreams.openai. Tyr records the provider-reported size of each Responses
+# reply, and a request that names previous_response_id reserves its own
+# estimate plus that size. A follow-up that names a response Tyr has no record
+# of gets 422 unknown_previous_response and the provider is not called. Without
+# this block, previous_response_id is rejected with 400.
+# Records are local to one Tyr process; give each replica its own file.
+# responsesState:
+#   # Created when missing. A relative path is resolved from this file's
+#   # directory, so mount a writable directory for it in a container.
+#   file: ./tyr-responses-state.jsonl
+#   # Most records kept at once; the oldest is dropped first.
+#   maxEntries: 10000
+#   # How long a record stays usable. The default is 30 days.
+#   ttlMs: 2592000000
+
 telemetry:
   metrics:
     # Prometheus text format is served at GET /metrics.

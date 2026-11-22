@@ -7,10 +7,20 @@ import type {
 import type { ApiShape } from "./adapters.js";
 import type { TyrRequestIdentity } from "./identity.js";
 import type { AdmissionProvenance, TyrPoolStats } from "./pools.js";
+import type { ResponsesStatePoolStats } from "./responses-state.js";
 import type { UpstreamFailure } from "./upstream-failure.js";
 import { TYR_VERSION } from "./version.js";
 
 export type TyrAdmissionOutcome = "admitted" | "bypassed" | "rejected";
+
+/**
+ * Rejections Tyr decides from its own state before a request reaches its
+ * pool. They never appear in the pool's `async-bulkhead-llm` counters.
+ */
+export type TyrStateRejectReason = "unknown_previous_response";
+
+/** Every bounded reason an admission decision can be rejected for. */
+export type TyrRejectReason = LLMRejectReason | TyrStateRejectReason;
 
 export type TyrRequestOutcome =
   | "success"
@@ -47,8 +57,13 @@ export type TyrAdmissionAuditEvent = {
   readonly model: string;
   readonly limitRevision: number;
   readonly admissionId?: string;
-  readonly reason?: LLMRejectReason;
+  readonly reason?: TyrRejectReason;
   readonly reservedTokens?: number;
+  /**
+   * Provider-reported tokens of the earlier responses a follow-up depends
+   * on. Included in `reservedTokens` when the pool has a token budget.
+   */
+  readonly priorTokens?: number;
   readonly resources?: LLMAdmissionResources;
   readonly restoration?: {
     readonly admissionSlot: {
@@ -284,7 +299,7 @@ export class TyrTelemetry {
     readonly pool: string;
     readonly priority: LLMPriority;
     readonly admissionClass?: string;
-    readonly reason: LLMRejectReason;
+    readonly reason: TyrRejectReason;
   }): void {
     this.#increment(this.#admissionDecisions, {
       pool: input.pool,
@@ -961,6 +976,75 @@ export class TyrTelemetry {
           Date.parse(current.expiresAt) / 1_000,
           { pool },
         );
+      }
+    }
+
+    // Response memory is opt-in. Its series exist only while it is enabled, so
+    // a gateway without it exposes exactly the metrics it did before.
+    const responsesStateMetrics: Array<{
+      name: string;
+      type: "counter" | "gauge";
+      help: string;
+      value: (snapshot: ResponsesStatePoolStats) => number;
+    }> = [
+      {
+        name: "tyr_pool_responses_state_records",
+        type: "gauge",
+        help: "Usable response records created through the pool.",
+        value: (snapshot) => snapshot.records,
+      },
+      {
+        name: "tyr_pool_responses_state_recorded_total",
+        type: "counter",
+        help: "Response records written.",
+        value: (snapshot) => snapshot.recorded,
+      },
+      {
+        name: "tyr_pool_responses_state_evicted_total",
+        type: "counter",
+        help: "Response records dropped to stay within the configured entry bound.",
+        value: (snapshot) => snapshot.evicted,
+      },
+      {
+        name: "tyr_pool_responses_state_expired_total",
+        type: "counter",
+        help: "Response records dropped after the configured lifetime.",
+        value: (snapshot) => snapshot.expired,
+      },
+      {
+        name: "tyr_pool_responses_state_follow_ups_total",
+        type: "counter",
+        help: "Follow-up requests that named a usable response record.",
+        value: (snapshot) => snapshot.followUps,
+      },
+      {
+        name: "tyr_pool_responses_state_prior_tokens_total",
+        type: "counter",
+        help: "Recorded tokens of the earlier responses that follow-up requests named.",
+        value: (snapshot) => snapshot.priorTokens,
+      },
+      {
+        name: "tyr_pool_responses_state_refused_total",
+        type: "counter",
+        help: "Follow-up requests refused because no usable response record exists.",
+        value: (snapshot) => snapshot.refused,
+      },
+      {
+        name: "tyr_pool_responses_state_persist_failures_total",
+        type: "counter",
+        help: "Response records not on disk when recorded, plus failed state file rewrites.",
+        value: (snapshot) => snapshot.persistFailures,
+      },
+    ];
+    if (poolNames.some((pool) => stats[pool]?.tyr.responsesState !== undefined)) {
+      for (const metric of responsesStateMetrics) {
+        addMetricHeader(lines, metric.name, metric.type, metric.help);
+        for (const pool of poolNames) {
+          const responsesState = stats[pool]?.tyr.responsesState;
+          if (responsesState !== undefined) {
+            addSample(lines, metric.name, metric.value(responsesState), { pool });
+          }
+        }
       }
     }
 

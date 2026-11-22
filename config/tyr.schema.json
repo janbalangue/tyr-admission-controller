@@ -423,6 +423,64 @@
           }
         }
       }
+    },
+    "retryHint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "minMs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 50
+        },
+        "maxMs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 30000
+        },
+        "halfLifeMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5000
+        },
+        "minSamples": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3
+        }
+      }
+    },
+    "responsesState": {
+      "type": "object",
+      "description": "Opt-in response memory for OpenAI Responses follow-ups. Requires upstreams.openai.",
+      "additionalProperties": false,
+      "required": [
+        "file"
+      ],
+      "properties": {
+        "file": {
+          "type": "string",
+          "minLength": 1,
+          "description": "State file, created when missing. A relative path is resolved from the configuration file's directory. Each Tyr process needs its own file."
+        },
+        "maxEntries": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000,
+          "default": 10000,
+          "description": "Most response records kept at once; the oldest is dropped first."
+        },
+        "ttlMs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2592000000,
+          "description": "Milliseconds a response record stays usable."
+        }
+      }
     }
   },
   "$defs": {

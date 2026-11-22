@@ -8,6 +8,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-11-22
+
+### Added
+
+- Opt-in response memory for OpenAI Responses follow-ups. A `responsesState`
+  block in the configuration file, or the same option on `createGateway`,
+  enables it. It has `file`, `maxEntries` (default 10,000) and `ttlMs`
+  (default 30 days).
+  - Tyr records the provider-reported size of each `2xx` Responses reply that
+    carries an `id` and `usage`, as `input_tokens + output_tokens`. A request
+    with `store: false` and a reply without usage are not recorded.
+  - A streamed reply is recorded only from an event that shows the response
+    is finished, by its status or, without one, by its event type. Usage on an
+    earlier event is ignored, so a stream that breaks off leaves no
+    undersized record.
+  - A request that names a recorded `previous_response_id` reserves its own
+    estimate plus the recorded size. The new `x-admission-prior-tokens`
+    response header reports that size. It is added after estimation, so
+    adaptive correction does not scale it, and follow-ups are not used as
+    calibration samples.
+  - A follow-up that names a response Tyr has no usable record of gets `422`
+    with `error.type: "unknown_previous_response"` and
+    `x-admission-reason: unknown_previous_response`. The provider is not
+    called. Observe mode does not shadow this refusal.
+  - Tyr keeps at most `maxEntries` records, drops the oldest first, and drops
+    each record `ttlMs` after it was written.
+  - Each record is appended to the state file before its reply ends, and Tyr
+    reads the file at startup, so a record survives a killed process. A partly
+    written last line is ignored. Tyr refuses to start on a file that is not a
+    Tyr state file or that uses a newer schema.
+  - When a write to the state file fails, Tyr stops appending, keeps the
+    records in memory, counts them in `persistFailures`, and retries a full
+    rewrite with a delay that doubles from 1 second to 5 minutes. A successful
+    rewrite saves every record it still holds.
+  - With identity configured, a record belongs to the tenant and application
+    that created it. A follow-up from another owner gets the same `422` as an
+    unknown id.
+- Per-pool `tyr.responsesState` counters in `/stats` and
+  `tyr_pool_responses_state_*` series in `/metrics`: records, recorded,
+  evicted, expired, follow-ups, prior tokens, refused, and persist failures.
+- `priorTokens` on the admission audit event of a follow-up, and an audit
+  event with `reason: "unknown_previous_response"` for each refusal.
+- `npm run verify:responses-state`, part of `release:check`. It starts the
+  built server from a configuration file, kills it with `SIGKILL` right after
+  a reply, and checks the follow-up after a restart.
+
+### Fixed
+
+- `config/tyr.schema.json` now accepts `retryHint`. The runtime has accepted
+  the block since 0.16.0, but the schema rejected it as an unknown key. A test
+  now holds the schema's top-level keys to the runtime's list, and the README
+  field reference lists the `retryHint` fields.
+
+### Compatibility
+
+- Nothing changes unless `responsesState` is configured. Requests, responses,
+  `/stats` and `/metrics` are the same as in 0.33.0, and
+  `previous_response_id` is still rejected with `400 invalid_request`.
+- With `responsesState` configured:
+  - Records are local to one process. A follow-up is admitted only on the
+    replica that recorded the response it names.
+  - With capacity routing on, a Responses request that names a record, or
+    whose reply will be recorded, is admitted on the replica that received it
+    and is not forwarded. A `store: false` request without
+    `previous_response_id` is still routed by capacity.
+  - `tyr_admission_rejections_total` gains the `reason` label value
+    `unknown_previous_response`, and the audit event's `reason` can carry it.
+    These refusals also count as rejected decisions in
+    `tyr_admission_decisions_total` and as `admission_rejected` in
+    `tyr_requests_total`. They never reach the pool, so
+    `tyr_pool_rejected_total` does not count them.
+  - Appends to the state file are not followed by `fsync`. A record survives a
+    killed Tyr process, but a host crash can lose the newest records.
+  - The directory that holds the state file must be writable, because Tyr
+    replaces the file by renaming a temporary file written next to it.
+  - `maxEntries` is one bound shared by all callers, not a per-tenant bound.
+  - `x-admission-prior-tokens` and the `priorTokens` counter report the
+    recorded size even on a pool without a token budget, where nothing is
+    reserved.
+  - A `previous_response_id` of `null` is treated as absent.
+- `conversation`, `background: true`, stored `prompt` templates,
+  `item_reference` and provider-managed tools are still rejected.
+- TypeScript embedders: `TyrAdmissionAuditEvent.reason` is now
+  `TyrRejectReason`, which adds `"unknown_previous_response"` to the
+  `async-bulkhead-llm` reasons. `Pool.prepare` takes an optional `priorTokens`
+  argument, and `Adapter.validate` takes an optional
+  `allowPreviousResponseId` flag. The other additions are optional fields.
+- No dependency change. `async-bulkhead-llm` stays at 3.17.0.
+
 ## [0.33.0] - 2026-09-23
 
 ### Added
