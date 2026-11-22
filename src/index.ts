@@ -46,6 +46,10 @@ if (source.kind === "file") {
   );
 }
 
+if (gateway.responsesState !== undefined) {
+  console.log(`responses state enabled file=${gateway.responsesState.file}`);
+}
+
 server.listen(port, () => {
   const routes = [
     gateway.upstreamUrl ? `/v1/messages -> ${gateway.upstreamUrl}` : undefined,

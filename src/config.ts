@@ -10,6 +10,7 @@ import {
   type TyrIdentityOptions,
 } from "./identity.js";
 import type { PoolConfig } from "./pools.js";
+import { MAX_RESPONSES_STATE_MAX_ENTRIES } from "./responses-state.js";
 import {
   BORROWED_ADMISSION_SLOT_RELEASE_MECHANISM,
   MAX_ADMISSION_CLASSES,
@@ -38,6 +39,26 @@ export type RuntimeConfig = {
   controlPlane?: LatchfloRuntimeConfig;
   source: RuntimeConfigSource;
 };
+
+/**
+ * Every top-level key a configuration file may contain. Exported so a test
+ * can hold `config/tyr.schema.json` to the same list.
+ */
+export const CONFIGURATION_ROOT_KEYS = [
+  "version",
+  "server",
+  "upstreams",
+  "timeouts",
+  "shutdown",
+  "priority",
+  "identity",
+  "routing",
+  "telemetry",
+  "retryHint",
+  "responsesState",
+  "pools",
+  "controlPlane",
+] as const;
 
 const LEGACY_CONFIG_ENV_NAMES = [
   "UPSTREAM_URL",
@@ -596,6 +617,28 @@ function normalizeCapacityRouting(
   };
 }
 
+
+function normalizeResponsesState(
+  value: unknown,
+  sourcePath: string,
+): GatewayOptions["responsesState"] | undefined {
+  if (value === undefined) return undefined;
+  const block = objectValue(value, "responsesState");
+  assertKnownKeys(block, ["file", "maxEntries", "ttlMs"], "responsesState");
+  return {
+    // Like controlPlane.agentTokenFile, a relative path is resolved from the
+    // directory that holds the configuration file.
+    file: resolve(
+      dirname(sourcePath),
+      requiredString(block["file"], "responsesState.file"),
+    ),
+    ...optionalIntegerEntry(block, "maxEntries", "responsesState.maxEntries", {
+      min: 1,
+      max: MAX_RESPONSES_STATE_MAX_ENTRIES,
+    }),
+    ...optionalIntegerEntry(block, "ttlMs", "responsesState.ttlMs", { min: 1 }),
+  };
+}
 
 function optionalString(
   parent: ObjectValue,
@@ -1444,24 +1487,7 @@ function normalizeFileConfiguration(
   env: NodeJS.ProcessEnv,
 ): RuntimeConfig {
   const root = objectValue(raw, "configuration");
-  assertKnownKeys(
-    root,
-    [
-      "version",
-      "server",
-      "upstreams",
-      "timeouts",
-      "shutdown",
-      "priority",
-      "identity",
-      "routing",
-      "telemetry",
-      "retryHint",
-      "pools",
-      "controlPlane",
-    ],
-    "configuration",
-  );
+  assertKnownKeys(root, CONFIGURATION_ROOT_KEYS, "configuration");
 
   const version = requiredInteger(root["version"], "version", { min: 1 });
   if (version !== 1) {
@@ -1543,6 +1569,15 @@ function normalizeFileConfiguration(
     optionalBoolean(priority, "trustHeader", "priority.trustHeader") ?? false;
   const identity = normalizeIdentity(root["identity"]);
   const capacityRouting = normalizeCapacityRouting(root["routing"], env);
+  const responsesState = normalizeResponsesState(
+    root["responsesState"],
+    source.path,
+  );
+  if (responsesState !== undefined && openaiUpstreamUrl === undefined) {
+    throw new Error(
+      "responsesState requires upstreams.openai, which enables the Responses route",
+    );
+  }
 
   const telemetry = optionalObjectValue(root, "telemetry", "telemetry") ?? {};
   assertKnownKeys(telemetry, ["metrics", "audit"], "telemetry");
@@ -1637,6 +1672,7 @@ function normalizeFileConfiguration(
       trustPriorityHeader,
       ...(identity === undefined ? {} : { identity }),
       ...(capacityRouting === undefined ? {} : { capacityRouting }),
+      ...(responsesState === undefined ? {} : { responsesState }),
       telemetry: { metricsEnabled, auditEnabled },
       retryHint,
       ...(operatorBearerToken === undefined ? {} : { operatorBearerToken }),

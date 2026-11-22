@@ -39,6 +39,7 @@ import {
   type AdmissionClassesConfig,
 } from "./admission-policy.js";
 import type { TyrRequestIdentity } from "./identity.js";
+import type { ResponsesStatePoolStats } from "./responses-state.js";
 
 export type AdmissionMode = LLMAdmissionMode;
 
@@ -172,7 +173,13 @@ export type AdmissionPreparation = {
   limits: LLMAdmissionLimits;
   /** Exact revision captured by the advisory capacity decision. */
   limitRevision: number;
+  /** Exact reservation for this request, including `priorTokens`. */
   reservation: LLMReservationEstimate | null;
+  /**
+   * Provider-reported tokens of earlier responses this request depends on.
+   * Present only for a request prepared as a follow-up.
+   */
+  priorTokens?: number;
   /** Bounded policy class selected for this request, when configured. */
   admissionClass?: string;
   advisory: LLMWouldAdmitResult;
@@ -262,6 +269,8 @@ export type TyrPoolStats = LLMStats & {
         activeAccountingHolds: number;
       };
     };
+    /** Response memory counters. Present only when `responsesState` is configured. */
+    responsesState?: ResponsesStatePoolStats;
   };
 };
 
@@ -282,10 +291,16 @@ export type Pool = {
   /** Exact immutable reservation preview used by capacity-aware routing. */
   estimate(request: LLMRequest): LLMReservationEstimate | null;
   resolveAdmissionClass(identity?: TyrRequestIdentity): string | undefined;
+  /**
+   * `priorTokens` marks the request as a follow-up to earlier provider-held
+   * responses of that size. The amount is added to the reservation exactly,
+   * after estimation, and the request is left out of adaptive calibration.
+   */
   prepare(
     request: LLMRequest,
     priority: LLMPriority,
     admissionClass?: string,
+    priorTokens?: number,
   ): AdmissionPreparation;
   run<T>(
     request: LLMRequest,
@@ -816,14 +831,25 @@ function createPool(
     recordAdmissionDecisionTiming("rejected", event);
   });
 
+  // A follow-up's provider-reported input includes earlier turns that its
+  // request body does not carry. Calibrating on it would compare that usage
+  // against an estimate of the visible request only and inflate the
+  // correction for every other request to the model, so follow-ups are not
+  // used as samples.
+  const followUpRequests = new WeakSet<LLMRequest>();
+
   if (adaptive !== undefined) {
     bulkhead.on("release", (event) => {
-      if (event.usage !== undefined) adaptive.observe(event.request, event.usage);
+      if (event.usage !== undefined && !followUpRequests.has(event.request)) {
+        adaptive.observe(event.request, event.usage);
+      }
     });
     // Native v3.11 observe mode has a separate release event because bypassed
     // calls never held local capacity. They still provide valuable calibration.
     bulkhead.on("bypassRelease", (event) => {
-      if (event.usage !== undefined) adaptive.observe(event.request, event.usage);
+      if (event.usage !== undefined && !followUpRequests.has(event.request)) {
+        adaptive.observe(event.request, event.usage);
+      }
     });
   }
 
@@ -844,10 +870,31 @@ function createPool(
     request: LLMRequest,
     priority: LLMPriority,
     admissionClass?: string,
+    priorTokens?: number,
   ): AdmissionPreparation {
+    if (
+      priorTokens !== undefined &&
+      (!Number.isSafeInteger(priorTokens) || priorTokens < 0)
+    ) {
+      throw new Error(
+        `${config.name} priorTokens must be a non-negative safe integer`,
+      );
+    }
     const effectiveAdmissionClass =
       admissionClass ?? admissionClasses?.defaultClass;
-    const reservation = bulkhead.estimate(request);
+    const estimated = bulkhead.estimate(request);
+    // Earlier tokens are an amount the provider reported, not an estimate.
+    // They are added after estimation so the adaptive correction, which
+    // scales the whole input estimate, never shrinks or stretches them.
+    const reservation: LLMReservationEstimate | null =
+      estimated !== null && priorTokens !== undefined && priorTokens > 0
+        ? Object.freeze({
+            input: estimated.input + priorTokens,
+            maxOutput: estimated.maxOutput,
+            reserved: estimated.reserved + priorTokens,
+          })
+        : estimated;
+    if (priorTokens !== undefined) followUpRequests.add(request);
     const decision = bulkhead.wouldAdmit(request, {
       priority,
       ...(effectiveAdmissionClass === undefined
@@ -871,6 +918,7 @@ function createPool(
       limits,
       limitRevision,
       reservation,
+      ...(priorTokens === undefined ? {} : { priorTokens }),
       ...(effectiveAdmissionClass === undefined
         ? {}
         : { admissionClass: effectiveAdmissionClass }),

@@ -53,6 +53,13 @@ import {
   type CapacityRoutingTopology,
   type InternalRouteClassification,
 } from "./routing.js";
+import {
+  recordableResponse,
+  recordableStreamResponse,
+  ResponsesStateStore,
+  type ResponsesStateOptions,
+  type ResponsesStateOwner,
+} from "./responses-state.js";
 
 export type GatewayOptions = {
   /**
@@ -165,6 +172,19 @@ export type GatewayOptions = {
   operatorBearerToken?: string;
   /** Optional Tyr-to-Tyr capacity-aware request routing. */
   capacityRouting?: CapacityRoutingOptions;
+  /**
+   * Opt-in response memory for OpenAI Responses follow-ups.
+   *
+   * With it, Tyr records the provider-reported size of each Responses reply
+   * and admits a request that names `previous_response_id` when it holds a
+   * record for that response, reserving the request's own estimate plus the
+   * recorded size. A follow-up without a usable record gets `422
+   * unknown_previous_response` and the provider is not called. Without this
+   * option, `previous_response_id` is rejected as an invalid request.
+   *
+   * Records are local to this process. Requires `openaiUpstreamUrl`.
+   */
+  responsesState?: ResponsesStateOptions;
   pools: PoolConfig[];
 };
 
@@ -510,6 +530,16 @@ function validateGatewayOptions(opts: GatewayOptions): void {
   ) {
     throw new Error("telemetry.auditSink must be a function");
   }
+  if (opts.responsesState !== undefined) {
+    if (typeof opts.responsesState !== "object" || opts.responsesState === null) {
+      throw new Error("responsesState must be an object");
+    }
+    if (opts.openaiUpstreamUrl === undefined) {
+      throw new Error(
+        "responsesState requires openaiUpstreamUrl, which enables the Responses route",
+      );
+    }
+  }
 }
 
 export function createGateway(opts: GatewayOptions) {
@@ -519,6 +549,25 @@ export function createGateway(opts: GatewayOptions) {
     onAdmissionDecisionTiming: (event) =>
       telemetry.recordAdmissionDecisionTiming(event),
   });
+  // Reads the state file now, so records from an earlier run are in place
+  // before the server can accept a follow-up.
+  const responsesState =
+    opts.responsesState === undefined
+      ? undefined
+      : new ResponsesStateStore(opts.responsesState);
+  const poolStats = (): Record<string, TyrPoolStats> => {
+    const stats = pools.stats();
+    if (responsesState === undefined) return stats;
+    return Object.fromEntries(
+      Object.entries(stats).map(([name, snapshot]) => [
+        name,
+        {
+          ...snapshot,
+          tyr: { ...snapshot.tyr, responsesState: responsesState.stats(name) },
+        },
+      ]),
+    );
+  };
   const retryHints = new RetryHintEstimator(opts.retryHint);
   const operatorBearerToken = opts.operatorBearerToken;
   const identityOptions = opts.identity;
@@ -527,7 +576,7 @@ export function createGateway(opts: GatewayOptions) {
     "x-tyr-identity-token";
   const control: TyrControlPlane = Object.freeze({
     limits: () => pools.limits(),
-    stats: () => pools.stats(),
+    stats: () => poolStats(),
     applyLimits: (updates) => pools.applyLimits(updates),
   });
   const anthropicUpstream = normalizeUpstreamUrl(opts.upstreamUrl, "upstreamUrl");
@@ -660,7 +709,11 @@ export function createGateway(opts: GatewayOptions) {
     }
   }
 
-  function makeHandler(adapter: Adapter, upstream: string) {
+  function makeHandler(
+    adapter: Adapter,
+    upstream: string,
+    state?: ResponsesStateStore,
+  ) {
     return async function handle(
       req: IncomingMessage,
       res: ServerResponse,
@@ -717,7 +770,10 @@ export function createGateway(opts: GatewayOptions) {
         return;
       }
 
-      const validation = adapter.validate(parsed, { maxOutputTokens });
+      const validation = adapter.validate(parsed, {
+        maxOutputTokens,
+        ...(state === undefined ? {} : { allowPreviousResponseId: true }),
+      });
       if (!validation.ok) {
         sendJson(res, 400, {
           error: { type: "invalid_request", errors: validation.errors },
@@ -797,9 +853,89 @@ export function createGateway(opts: GatewayOptions) {
         );
       }
 
+      // Response memory. A follow-up carries none of the earlier turns in its
+      // body, so it is admitted only when this replica recorded the response
+      // it names, and it then reserves that recorded size as well.
+      const previousResponseId =
+        state !== undefined && typeof body["previous_response_id"] === "string"
+          ? body["previous_response_id"]
+          : undefined;
+      const stateOwner: ResponsesStateOwner | undefined =
+        state === undefined || requestIdentity === undefined
+          ? undefined
+          : {
+              ...(requestIdentity.tenantId === undefined
+                ? {}
+                : { tenantId: requestIdentity.tenantId }),
+              ...(requestIdentity.applicationId === undefined
+                ? {}
+                : { applicationId: requestIdentity.applicationId }),
+            };
+      let priorTokens: number | undefined;
+      if (state !== undefined && previousResponseId !== undefined) {
+        priorTokens = state.resolveFollowUp({
+          pool: pool.name,
+          responseId: previousResponseId,
+          ...(stateOwner === undefined ? {} : { owner: stateOwner }),
+        });
+        if (priorTokens === undefined) {
+          // Never recorded here, dropped, expired, or owned by someone else.
+          // The caller cannot tell which, and the provider is not called.
+          const limitRevision = pool.controller.limits().revision;
+          telemetry.recordRejection({
+            pool: pool.name,
+            priority,
+            ...(admissionClass === undefined ? {} : { admissionClass }),
+            reason: "unknown_previous_response",
+          });
+          telemetry.emitAdmissionAudit({
+            outcome: "rejected",
+            settlement: "rejected",
+            pool: pool.name,
+            provider: adapter.shape,
+            priority,
+            ...(admissionClass === undefined ? {} : { admissionClass }),
+            ...(requestIdentity === undefined
+              ? {}
+              : { identity: requestIdentity }),
+            model,
+            limitRevision,
+            reason: "unknown_previous_response",
+          });
+          telemetry.recordRequest({
+            pool: pool.name,
+            provider: adapter.shape,
+            outcome: "admission_rejected",
+            durationSeconds: (performance.now() - requestStartedAt) / 1_000,
+          });
+          res.setHeader("x-admission-mode", pool.mode);
+          res.setHeader("x-admission-revision", String(limitRevision));
+          if (admissionClass !== undefined) {
+            res.setHeader("x-admission-class", admissionClass);
+          }
+          res.setHeader("x-admission-reason", "unknown_previous_response");
+          sendJson(res, 422, {
+            error: {
+              type: "unknown_previous_response",
+              message:
+                "Tyr has no usable record of the response named by previous_response_id, so it cannot reserve the earlier tokens",
+              pool: pool.name,
+            },
+          });
+          return;
+        }
+      }
+      // A reply that will be recorded, and a request that names a record, are
+      // admitted on the replica that received them. Records are not shared
+      // between replicas, so forwarding either would leave the record, or
+      // look for it, on a replica the caller is not talking to.
+      const recordsReply = state !== undefined && body["store"] !== false;
+      const admitLocally = recordsReply || previousResponseId !== undefined;
+
       if (
         capacityRouter !== undefined &&
-        routeClassification.kind === "external"
+        routeClassification.kind === "external" &&
+        !admitLocally
       ) {
         const reservation = pool.estimate(llmRequest);
         const route = capacityRouter.select({
@@ -825,7 +961,12 @@ export function createGateway(opts: GatewayOptions) {
 
       // Calculate one immutable reservation and pass it verbatim to both the
       // detailed advisory check and the authoritative admission path.
-      const preparation = pool.prepare(llmRequest, priority, admissionClass);
+      const preparation = pool.prepare(
+        llmRequest,
+        priority,
+        admissionClass,
+        priorTokens,
+      );
       res.setHeader("x-admission-mode", preparation.mode);
       res.setHeader(
         "x-admission-preview-revision",
@@ -851,6 +992,9 @@ export function createGateway(opts: GatewayOptions) {
           "x-admission-reserved-tokens",
           String(preparation.reservation.reserved),
         );
+      }
+      if (priorTokens !== undefined) {
+        res.setHeader("x-admission-prior-tokens", String(priorTokens));
       }
 
       const wantsStream = adapter.isStreamRequested(body);
@@ -904,6 +1048,26 @@ export function createGateway(opts: GatewayOptions) {
           abort.abort();
         }
       });
+
+      // Called before the bytes that carry a finished response reach the
+      // client, so a record is on disk before its reply ends.
+      const recordResponse = (
+        recordable: { id: string; tokens: number } | undefined,
+      ): void => {
+        if (state === undefined || !recordsReply || recordable === undefined) {
+          return;
+        }
+        try {
+          state.record({
+            pool: pool.name,
+            responseId: recordable.id,
+            tokens: recordable.tokens,
+            ...(stateOwner === undefined ? {} : { owner: stateOwner }),
+          });
+        } catch {
+          // Response memory must never affect proxying.
+        }
+      };
 
       const headers: Record<string, string> = {};
       for (const header of adapter.forwardHeaders) {
@@ -974,6 +1138,7 @@ export function createGateway(opts: GatewayOptions) {
                 ...(ctx.reservation === null
                   ? {}
                   : { reservedTokens: ctx.reservation.reserved }),
+                ...(priorTokens === undefined ? {} : { priorTokens }),
                 resources: ctx.resources,
                 ...(ctx.provenance === undefined
                   ? {}
@@ -1033,10 +1198,20 @@ export function createGateway(opts: GatewayOptions) {
                   "cache-control": "no-cache",
                   connection: "keep-alive",
                 });
-                const extractor = adapter.createStreamExtractor((usage) => {
-                  observedUsage = usage;
-                  ctx?.reportUsage(usage);
-                });
+                const extractor = adapter.createStreamExtractor(
+                  (usage) => {
+                    observedUsage = usage;
+                    ctx?.reportUsage(usage);
+                  },
+                  // A stream can stop early, so only an event that shows
+                  // the response is finished may create a record.
+                  recordsReply && upstreamRes.ok
+                    ? (response, eventType) =>
+                        recordResponse(
+                          recordableStreamResponse(response, eventType),
+                        )
+                    : undefined,
+                );
                 const decoder = new TextDecoder();
 
                 let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1070,6 +1245,19 @@ export function createGateway(opts: GatewayOptions) {
               }
 
               const text = await upstreamRes.text();
+              let parsedReply: unknown;
+              let replyParsed = false;
+              if (recordsReply && upstreamRes.ok) {
+                // Record before replying: the client must not be able to read
+                // the new id before the record that makes it usable exists.
+                try {
+                  parsedReply = JSON.parse(text);
+                  replyParsed = true;
+                } catch {
+                  // Non-JSON upstream response: nothing to record.
+                }
+                if (replyParsed) recordResponse(recordableResponse(parsedReply));
+              }
               res.writeHead(upstreamRes.status, {
                 "content-type":
                   upstreamRes.headers.get("content-type") ??
@@ -1079,7 +1267,9 @@ export function createGateway(opts: GatewayOptions) {
               res.end(text);
 
               try {
-                observedUsage = adapter.parseUsage(JSON.parse(text));
+                observedUsage = adapter.parseUsage(
+                  replyParsed ? parsedReply : JSON.parse(text),
+                );
               } catch {
                 // Non-JSON upstream response: no usage to report.
               }
@@ -1192,6 +1382,7 @@ export function createGateway(opts: GatewayOptions) {
             ...(preparation.reservation === null
               ? {}
               : { reservedTokens: preparation.reservation.reserved }),
+            ...(priorTokens === undefined ? {} : { priorTokens }),
             ...(provenance === undefined ? {} : { grant: provenance }),
           });
           recordRequest("admission_rejected");
@@ -1305,7 +1496,7 @@ export function createGateway(opts: GatewayOptions) {
     ? makeHandler(openaiAdapter, openaiUpstream)
     : undefined;
   const handleOpenAIResponses = openaiUpstream
-    ? makeHandler(openaiResponsesAdapter, openaiUpstream)
+    ? makeHandler(openaiResponsesAdapter, openaiUpstream, responsesState)
     : undefined;
 
   async function authorizeOperator(
@@ -1344,7 +1535,7 @@ export function createGateway(opts: GatewayOptions) {
   ): Promise<void> {
     if (!(await authorizeOperator(req, res))) return;
     if (pathname === "/stats") {
-      sendJson(res, 200, pools.stats());
+      sendJson(res, 200, poolStats());
       return;
     }
     if (!telemetry.metricsEnabled) {
@@ -1354,7 +1545,7 @@ export function createGateway(opts: GatewayOptions) {
     sendText(
       res,
       200,
-      telemetry.renderPrometheus(pools.stats(), opts.isReady?.() ?? true),
+      telemetry.renderPrometheus(poolStats(), opts.isReady?.() ?? true),
       "text/plain; version=0.0.4; charset=utf-8",
     );
   }
@@ -1459,12 +1650,17 @@ export function createGateway(opts: GatewayOptions) {
     });
 
     shuttingDown = (async () => {
-      const drainResult = await pools.drain(shutdownDrainTimeoutMs);
-      if (!drainResult.drained) {
-        server.closeAllConnections();
+      try {
+        const drainResult = await pools.drain(shutdownDrainTimeoutMs);
+        if (!drainResult.drained) {
+          server.closeAllConnections();
+        }
+        await serverClosed;
+        return drainResult;
+      } finally {
+        // Every record is already on disk; this only releases the file.
+        responsesState?.close();
       }
-      await serverClosed;
-      return drainResult;
     })();
 
     return shuttingDown;
