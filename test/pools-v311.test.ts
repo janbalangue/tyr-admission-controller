@@ -915,3 +915,66 @@ describe("exact admission provenance", () => {
     );
   });
 });
+
+describe("v3.18 stop policy", () => {
+  it("does not forward a stop policy from a limits update to the engine", async () => {
+    const pools = createPools([
+      {
+        name: "unstopped",
+        modelPrefixes: ["gpt"],
+        model: "gpt-4o",
+        maxConcurrent: 2,
+        initialRevision: 1,
+      },
+    ]);
+    const pool = pools.get("unstopped")!;
+
+    let started!: () => void;
+    const callbackStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let finish!: (value: string) => void;
+    let callbackSignal: AbortSignal | undefined;
+    const llmRequest = request();
+    const running = pool.run(
+      llmRequest,
+      pool.prepare(llmRequest, "normal"),
+      (signal) => {
+        callbackSignal = signal;
+        started();
+        return new Promise<string>((resolve) => {
+          finish = resolve;
+        });
+      },
+      { priority: "normal" },
+    );
+    await callbackStarted;
+
+    // The engine would stop the running call on the next timer tick if this
+    // policy reached it: the snapshot leaves one call above maxConcurrent 0.
+    const result = pools.applyLimits([
+      {
+        pool: "unstopped",
+        limits: {
+          revision: 2,
+          maxConcurrent: 0,
+          maxQueue: 0,
+          stop: { takeBackGraceMs: 0 },
+        },
+      },
+    ]);
+    expect(result).toMatchObject({ applied: true });
+    expect(pools.limits().unstopped).toEqual({
+      revision: 2,
+      maxConcurrent: 0,
+      maxQueue: 0,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(callbackSignal?.aborted ?? false).toBe(false);
+    expect(pool.stats().llm.stopped).toBeUndefined();
+
+    finish("done");
+    await expect(running).resolves.toBe("done");
+  });
+});

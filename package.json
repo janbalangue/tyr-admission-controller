@@ -1,6 +1,6 @@
 {
   "name": "tyr-admission-controller",
-  "version": "0.34.0",
+  "version": "0.34.1",
   "private": true,
   "license": "Apache-2.0",
   "description": "Tyr is a capacity guard for LLM traffic that reserves expected token capacity before execution, sheds requests that would overcommit a model pool, and reconciles reservations from live provider usage.",
@@ -53,7 +53,7 @@
     "verify:responses-state": "npm run build && node scripts/verify-responses-state.mjs"
   },
   "dependencies": {
-    "async-bulkhead-llm": "3.17.0",
+    "async-bulkhead-llm": "3.18.0",
     "yaml": "^2.9.0"
   },
   "devDependencies": {

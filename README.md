@@ -12,9 +12,9 @@ Tyr runs on its own. Latchflo, a separately licensed control plane, can
 coordinate one capacity envelope across many Tyr replicas; see
 [Latchflo managed mode](#latchflo-managed-mode).
 
-> **Status:** v0.34.0, pre-1.0, licensed under Apache-2.0 (see
+> **Status:** v0.34.1, pre-1.0, licensed under Apache-2.0 (see
 > [`LICENSE.txt`](LICENSE.txt)). Built on
-> [`async-bulkhead-llm@3.17.0`](https://www.npmjs.com/package/async-bulkhead-llm).
+> [`async-bulkhead-llm@3.18.0`](https://www.npmjs.com/package/async-bulkhead-llm).
 
 ## Evaluate Tyr in five minutes
 
@@ -396,7 +396,7 @@ curl -i http://127.0.0.1:8787/v1/responses \
   }'
 ```
 
-Tyr 0.34.0 supports synchronous and streaming Responses requests. To keep
+Tyr 0.34.1 supports synchronous and streaming Responses requests. To keep
 pre-admission token reservations bounded, it rejects server-side
 `conversation`, stored `prompt` templates, `item_reference`,
 `background: true`, and provider-managed retrieval/computer tools.
@@ -433,7 +433,7 @@ configuration documented in [`.env.example`](.env.example).
 ## Progressive streaming reconciliation
 
 Progressive reconciliation, introduced in Tyr 0.22, uses the current
-`async-bulkhead-llm@3.17.0` runtime to account for the work still ahead
+`async-bulkhead-llm@3.18.0` runtime to account for the work still ahead
 instead of retaining tokens the provider has already processed. For a
 streaming request, the first cumulative input report returns the completed
 input reservation. Later cumulative output reports shrink the remaining
@@ -454,7 +454,7 @@ pools:
 coalescing, and early-release counters. Disable the block explicitly to retain
 the conservative 3.12 hold behavior. Streams without cumulative provider usage
 remain conservative automatically. The repository lockfile resolves the bundled
-`vendor/async-bulkhead-llm-3.17.0.tgz` and
+`vendor/async-bulkhead-llm-3.18.0.tgz` and
 `vendor/async-bulkhead-ts-1.0.1.tgz`, so the release can be built before those
 artifacts are fetched from a public registry.
 
@@ -817,7 +817,7 @@ tyr validate --config ./deploy/tyr.yaml
 Build the included image:
 
 ```bash
-docker build -t tyr-admission-controller:0.34.0 .
+docker build -t tyr-admission-controller:0.34.1 .
 ```
 
 The source tree must include the committed `vendor/` directory. Run `npm run verify:vendor` before building or publishing a source archive.
@@ -831,7 +831,7 @@ docker run --rm \
   -p 127.0.0.1:8787:8787 \
   -e TYR_CONFIG_FILE=/etc/tyr/config.yaml \
   -v "$PWD/tyr.yaml:/etc/tyr/config.yaml:ro" \
-  tyr-admission-controller:0.34.0
+  tyr-admission-controller:0.34.1
 ```
 
 A configuration that uses `responsesState` also needs a writable mount for the
@@ -963,7 +963,7 @@ pool name, configured admission-class ID, provider shape, priority, status
 class, outcome, and enumerated reason. Model strings, request IDs, admission
 IDs, grant IDs, and tenant-supplied identity values never become metric labels.
 
-Tyr 0.34.0 carries forward two admission-path histograms.
+Tyr 0.34.1 carries forward two admission-path histograms.
 `tyr_admission_decision_seconds` measures synchronous local decision work and
 **excludes** the awaited local concurrency acquire.
 `tyr_admission_queue_wait_seconds` measures that acquire wait separately. Both
@@ -1037,7 +1037,7 @@ is logged but never returned to the caller.
 - Upstream response headers are not generally passed through; Tyr returns the
   upstream status and body with a normalized content type.
 - There is no Anthropic/OpenAI format translation.
-- Response memory is per process in v0.34.0. A `previous_response_id`
+- Response memory is per process in v0.34.1. A `previous_response_id`
   follow-up is admitted only on the replica that recorded the response it
   names, and capacity routing does not forward Responses requests that create
   or use a record. A response deleted at the provider keeps its record until
@@ -1048,7 +1048,8 @@ is logged but never returned to the caller.
   rejected until Tyr can reserve their capacity without undercounting unseen
   state.
 - There is no active-stream termination policy for post-admission usage
-  overruns.
+  overruns. `async-bulkhead-llm@3.18.0` can stop work it has admitted, but Tyr
+  0.34.1 applies no stop policy and stops nothing.
 - Multi-controller Latchflo failover, tenant policy, and supported Helm packaging
   remain roadmap work.
 
@@ -1172,7 +1173,7 @@ controlPlane:
   metadata:
     region: us-west
     zone: us-west-2a
-    version: 0.34.0
+    version: 0.34.1
     endpoint: http://tyr-a:8787
     labels:
       environment: demo
@@ -1202,7 +1203,7 @@ bounded by `requestTimeoutMs`.
 ### Demand-aware Latchflo heartbeats
 
 Tyr automatically derives one snapshot per managed pool from its existing
-statistics. Tyr 0.34.0 carries forward bounded per-class demand in that additive
+statistics. Tyr 0.34.1 carries forward bounded per-class demand in that additive
 heartbeat while preserving the original pool-level fields:
 
 ```json
@@ -1257,7 +1258,7 @@ identity values never become heartbeat keys. `protected*` and `borrowed*` fields
 report current use of the active floor and shared remainder. They are telemetry,
 not a request for Tyr to resize its own limits.
 
-Tyr 0.34.0 advertises `admissionClassDemand: true`,
+Tyr 0.34.1 advertises `admissionClassDemand: true`,
 `grantOccupancyAck: true`, `admissionClassOccupancyAck: true`, and the additive
 `borrowedAdmissionSlotDeadlines: true` capability at registration. Older control
 planes that ignore unknown capability and nested evidence fields remain
@@ -1290,7 +1291,7 @@ The acknowledgement's `occupancy` object is additive observability evidence;
 Latchflo 0.10.0 does not need to trust it to commit a transfer. The fresh
 post-ack heartbeat remains the authoritative proof used by that control plane.
 
-Tyr 0.34.0 applies the same ordering to restrictive class-only changes. When a
+Tyr 0.34.1 applies the same ordering to restrictive class-only changes. When a
 protected floor is restored, the newly protected capacity reduces the shared
 remainder. Tyr therefore keeps publishing bounded class evidence until the sum
 of `borrowedConcurrent` fits within the desired shared concurrency remainder and,
@@ -1361,7 +1362,7 @@ src/
   index.ts          validated process entrypoint and managed-mode lifecycle
   latchflo.ts        built-in Latchflo agent, retry, readiness, demand heartbeat, and token persistence
   demand.ts          accepted-heartbeat demand deltas derived from live pool statistics
-  pools.ts          v3.16 policy runtime, progressive reconciliation, versioned limits, observe mode, and drain
+  pools.ts          v3.18 policy runtime, progressive reconciliation, versioned limits, observe mode, and drain
   routing.ts        protected peer snapshots and request-specific replica selection
   responses-state.ts response memory for Responses follow-ups and its state file
   server.ts         HTTP proxy, routing, admission, telemetry, timeouts, and shutdown

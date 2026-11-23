@@ -8,6 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.1] - 2026-11-23
+
+### Changed
+
+- Updated the exact vendored runtime dependency from
+  `async-bulkhead-llm@3.17.0` to `async-bulkhead-llm@3.18.0`. This also brings
+  in 3.17.1, which restructured the library internally without changing its
+  API or behavior. The tarball in `vendor/` is the artifact npm published.
+- Tyr's own behavior is unchanged. 3.18.0 adds an opt-in way to stop work the
+  library has already admitted. Tyr applies no stop policy and does not ask a
+  drain to stop work, so no admitted request is stopped.
+
+### Added
+
+- A test that a `stop` policy on a limits update does not reach the library.
+
+### Compatibility
+
+- Requests, responses, `/stats`, `/metrics`, audit events and the shutdown
+  drain result are the same as in 0.34.0. The 0.34.0 build on 3.17.0 and this
+  build were driven with the same 19 requests, covering all three provider
+  routes, streaming, rejections, a borrowed-slot deadline, observe mode,
+  runtime limit updates and a bounded drain. Everything they returned and
+  reported matched, apart from ids, timestamps, timings and the version.
+- `control.applyLimits` and Latchflo managed mode rebuild each limits snapshot
+  from the fields Tyr knows, so a `stop` field on an update is dropped, as any
+  unknown field already was. The update is still applied.
+- TypeScript embedders:
+  - The library's types gain optional fields, among them
+    `LLMAdmissionLimits.stop`, `LLMDrainResult.stopped`, and `stopped` and
+    `stoppedByCause` under `llm` in pool stats. Tyr never sets them, and they
+    are absent from `/stats`.
+  - `Pool.controller.applyLimits` still hands its snapshot to the library as
+    given. A caller that passes `stop` there turns on stops that Tyr 0.34.1
+    has no handling for, so do not pass it.
+- No configuration, schema or route changed.
+
 ## [0.34.0] - 2026-11-22
 
 ### Added

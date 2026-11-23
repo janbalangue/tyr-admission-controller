@@ -1,28 +1,62 @@
-# Tyr 0.34.0 verification
+# Tyr 0.34.1 verification
 
-Date: 2026-11-22
+Date: 2026-11-23
 
 ## Version alignment
 
-- Tyr package version: `0.34.0`
-- Runtime version constant: `0.34.0`
-- Runtime dependency: `async-bulkhead-llm@3.17.0`
+- Tyr package version: `0.34.1`
+- Runtime version constant: `0.34.1`
+- Runtime dependency: `async-bulkhead-llm@3.18.0`
 - Transitive bulkhead dependency: `async-bulkhead-ts@1.0.1`
 - Vendored runtime artifacts:
-  - `vendor/async-bulkhead-llm-3.17.0.tgz`
+  - `vendor/async-bulkhead-llm-3.18.0.tgz`
   - `vendor/async-bulkhead-ts-1.0.1.tgz`
   - `vendor/yaml-2.9.0.tgz`
 - Package repository: `https://github.com/mofluxhq/tyr-admission-controller.git`
 
 ## Required release order
 
-`async-bulkhead-llm@3.17.0` was published for Tyr 0.30.0; 0.34.0 uses the same
-release. `async-bulkhead-llm@3.17.1` restructures the library internally and
-changes no API or behavior, so 0.34.0 does not adopt it and changes Tyr's own
-code only. Tyr's committed lockfile intentionally resolves the exact bundled
-`vendor/async-bulkhead-llm-3.17.0.tgz`, so the Tyr build is reproducible while
-the dependency release is staged; the vendor artifact is not a substitute for
+`async-bulkhead-llm@3.18.0` was published to npm on 2026-11-23, before this
+release was built. 0.34.1 moves Tyr from 3.17.0 to 3.18.0 and changes nothing
+in Tyr's own source except the version constant. Tyr's committed lockfile
+intentionally resolves the
+exact bundled `vendor/async-bulkhead-llm-3.18.0.tgz`, so the Tyr build is
+reproducible without the registry; the vendor artifact is not a substitute for
 publishing the declared public package version.
+`npm run verify:vendor-provenance` confirms the bundled tarball is
+byte-identical to the published one.
+
+## Library update (0.34.1)
+
+3.18.0 can stop work it has already admitted, when a limits snapshot carries a
+`stop` policy or a drain passes `stopOnTimeout`. Tyr does neither, so this
+release must behave as 0.34.0 did on 3.17.0. Three checks cover that:
+
+- **The existing suite.** All 273 tests from 0.34.0 and every executable
+  verifier pass on 3.18.0. The only edit to an existing test is the version
+  string one assertion expects.
+- **The policy cannot arrive by accident.** A new test in
+  `test/pools-v311.test.ts` applies a limits update that carries
+  `stop: { takeBackGraceMs: 0 }` and leaves one running call above the new
+  ceiling. The update is applied, the applied snapshot has no `stop`, and the
+  call runs to completion. With the field forwarded to the library, the same
+  test fails: the call is rejected with `LLMAdmissionStoppedError`.
+- **Same output as 0.34.0.** The 0.34.0 build on 3.17.0 and this build were
+  each started with three pools and sent the same 19 requests: Chat
+  Completions, Messages and Responses, plain and streamed, a high-priority
+  request, budget and concurrency rejections, an upstream `500`, an
+  observe-mode bypass, a borrowed slot that outlived its 60 ms lease, a kill
+  switch and a restore through `control.applyLimits`, and a bounded drain
+  with one call still running. The comparison covered every reply with its
+  admission headers and body, `/stats`, `/metrics`, the 17 audit events, the
+  applied limits and the drain result: 2,278 values per run. Five pairs of
+  runs showed no difference.
+
+The comparison leaves out values that differ between two runs of one build:
+admission ids, timestamps, nanosecond timings, port numbers, the version
+string, the bucket and sum samples of the duration histograms (their counts
+are compared), and the retry hint, which is computed from wall-clock
+completion intervals.
 
 ## Response memory (0.34.0)
 
@@ -254,7 +288,7 @@ still has no synchronous control-plane call.
 
 ## Carried-forward compatibility
 
-Tyr 0.34.0 retains the native Anthropic Messages, OpenAI Chat Completions, and
+Tyr 0.34.1 retains the native Anthropic Messages, OpenAI Chat Completions, and
 OpenAI Responses routes from 0.29.0. Responses requests stay stateless unless
 `responsesState` is configured. Existing identity, routing,
 managed-mode, provenance, timing, retry-hint, and progressive-reconciliation
@@ -286,21 +320,21 @@ git diff --check
 
 ## Recorded results
 
-The full release gate passed on the development Mac on 2026-11-22, on Node.js
+The full release gate passed on the development Mac on 2026-11-23, on Node.js
 24.18.0, in about 45 seconds:
 
-- 17 Vitest files passed, containing 273 tests;
+- 17 Vitest files passed, containing 274 tests;
 - every executable verifier passed, including the seven borrowed-restoration
   assertions and `verify:responses-state`;
 - both shipped YAML examples passed runtime CLI validation;
 - telemetry smoke and `git diff --check` passed;
-- `npm pack --dry-run` included 53 files, approximately 162.3 kB packed and
-  678.1 kB unpacked.
+- `npm pack --dry-run` included 53 files, approximately 162.9 kB packed and
+  680.0 kB unpacked.
 
 `npm run verify:vendor-provenance` also passed: the three vendored artifacts
-match their published releases. The Vitest suite and
-`scripts/verify-responses-state.mjs` also passed locally on Node.js 20.20.0
-and 22.23.1, with 273 tests on each. CI was not run for this record.
+match their published releases. The Vitest suite, every offline verifier, the
+quick evaluation and the telemetry smoke also passed locally on Node.js
+20.20.0 and 22.23.1, with 274 tests on each. CI was not run for this record.
 
 The final ZIP is checked from a fresh extraction before delivery. It excludes
 platform-specific `node_modules`; consumers install the locked development
