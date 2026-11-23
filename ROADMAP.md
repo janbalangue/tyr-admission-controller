@@ -2,7 +2,7 @@
 
 Tyr is an LLM admission controller. Its purpose is to prevent concurrent AI workloads from overcommitting finite provider or inference capacity by reserving token capacity before upstream execution begins.
 
-This roadmap prioritizes the shortest path from the current `v0.34.0`
+This roadmap prioritizes the shortest path from the current `v0.34.1`
 response-memory release to a commercially credible product. It
 assumes one experienced TypeScript/backend engineer, automated tests and
 documentation for every milestone, and no custom management UI before
@@ -25,7 +25,7 @@ The initial commercial promise is:
 5. **Control cardinality.** Tenant, application, model, and request identifiers must not create unbounded metric labels or bulkhead instances.
 6. **Preserve a small data plane.** Authentication, admission, forwarding, and telemetry belong in the gateway; historical analytics and fleet coordination may live outside it.
 
-## Current baseline: v0.34.0
+## Current baseline: v0.34.1
 
 The current release provides:
 
@@ -46,7 +46,7 @@ The current release provides:
   `tyr.diagnostic.v1` event.
 - Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses proxy routes.
 - Model-prefix routing to independently configured local pools.
-- A v3.17 pool policy runtime using exact reservation previews, native observe
+- A v3.18 pool policy runtime using exact reservation previews, native observe
   mode, and complete versioned admission-limit snapshots.
 - Optional wall-clock leases for borrowed local admission slots, with split
   concurrency/token accounting and resource-specific restoration evidence.
@@ -514,6 +514,17 @@ Outcome:
 - Tyr keeps its pre-upstream token-reservation guarantee explicit rather than
   pretending unseen provider-managed state can be estimated safely.
 
+### v0.34.1 — async-bulkhead-llm 3.18.0 — shipped 2026-11-23
+
+- Updated the vendored `async-bulkhead-llm` from 3.17.0 to 3.18.0, which also brings in the internal restructuring of 3.17.1.
+- No Tyr behavior changed. Requests, responses, `/stats`, `/metrics` and audit events match 0.34.0.
+
+Outcome:
+
+- Tyr runs on the library release that can stop admitted work, with that capability left off.
+
+Not in this release: stopping admitted work. Tyr applies no stop policy and does not stop work at the drain deadline.
+
 ### v0.34.0 — Response memory for Responses follow-ups — shipped 2026-11-22
 
 - Added opt-in `responsesState`. Tyr records the provider-reported size of each Responses reply, and a `previous_response_id` follow-up reserves its own estimate plus that size.
@@ -573,7 +584,7 @@ Outcome:
 
 ### v1.0.0 — Supported production release
 
-**Timing:** After v0.34.0 and sufficient design-partner validation.
+**Timing:** After v0.34.1 and sufficient design-partner validation.
 **Goal:** Provide a stable, documented, supportable product for production design partners.
 
 Planned work:
