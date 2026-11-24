@@ -113,7 +113,27 @@
         "drainTimeoutMs": {
           "type": "integer",
           "minimum": 0
+        },
+        "stopOnDrainTimeout": {
+          "type": "boolean",
+          "default": false,
+          "description": "Stop requests still running when drainTimeoutMs elapses; requires drainTimeoutMs."
         }
+      },
+      "if": {
+        "properties": {
+          "stopOnDrainTimeout": {
+            "const": true
+          }
+        },
+        "required": [
+          "stopOnDrainTimeout"
+        ]
+      },
+      "then": {
+        "required": [
+          "drainTimeoutMs"
+        ]
       }
     },
     "controlPlane": {
@@ -627,8 +647,62 @@
         },
         "admissionClasses": {
           "$ref": "#/$defs/admissionClasses"
+        },
+        "stop": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "description": "Opt-in stopping of admitted requests. Requires admissionMode enforce.",
+          "properties": {
+            "overrunAllowanceTokens": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Tokens a request's hold may grow above its reservation before it is stopped; requires inFlightTokenBudget."
+            },
+            "takeBackGraceMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 2147483647,
+              "description": "Milliseconds after a limits update before requests above the new limits are stopped."
+            }
+          }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "stop": {
+                "required": [
+                  "overrunAllowanceTokens"
+                ]
+              }
+            },
+            "required": [
+              "stop"
+            ]
+          },
+          "then": {
+            "required": [
+              "inFlightTokenBudget"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "stop"
+            ]
+          },
+          "then": {
+            "properties": {
+              "admissionMode": {
+                "const": "enforce"
+              }
+            }
+          }
+        }
+      ]
     },
     "admissionClassLimits": {
       "type": "object",

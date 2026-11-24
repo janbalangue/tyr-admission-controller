@@ -8,6 +8,148 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-11-23
+
+### Added
+
+- Opt-in stopping of admitted requests, made by `async-bulkhead-llm@3.18.0`.
+  Nothing is stopped unless it is configured.
+  - `pools[].stop.overrunAllowanceTokens` stops a request whose token hold
+    grows more than the allowance above its reservation. While it is set, a
+    usage report that leaves the pool above its token budget, or a class above
+    `maxInFlightTokens`, also stops requests until the rest fit. It requires
+    `inFlightTokenBudget`.
+  - `pools[].stop.takeBackGraceMs` stops the requests a limits update left
+    above the new limits, once the grace period has ended. A request that
+    finishes inside it is left alone, and a newer update restarts it.
+  - `shutdown.stopOnDrainTimeout` stops the requests still running when
+    `shutdown.drainTimeoutMs` elapses, before Tyr closes the remaining
+    connections. It requires `drainTimeoutMs` and applies to every pool.
+  - A stopped request that has been sent no part of its reply gets `503` with
+    `error.type: "admission_stopped"`, `error.cause`,
+    `x-admission-reason: stopped` and `x-admission-stop-cause`. Once part of
+    a reply has been written, the reply is cut. Neither gets a retry hint.
+  - A stop returns the request's concurrency slot at once and drops the
+    upstream call. The request's tokens are returned when that call has
+    ended on Tyr's side, normally within milliseconds.
+  - The usage a provider sends as it ends a reply does not stop that reply.
+    On a pool with an overrun allowance it is applied when the request
+    completes.
+  - Tyr states the pool's configured policy on every limits update it
+    applies, including Latchflo grants and the zero-capacity revision applied
+    when a grant expires. A pool that starts open applies it at startup.
+  - `createGateway` takes the same settings: `stop` on a pool, and
+    `shutdownStopOnDrainTimeout`.
+- Stop reporting:
+  - `/stats`: `limits.stop`, and `tyr.stop` with the configured `policy`,
+    `stopped` and `stoppedByCause`.
+  - `/metrics`: `tyr_pool_stopped_total{pool,cause}`,
+    `tyr_pool_admission_class_stopped_total`,
+    `tyr_pool_stop_overrun_allowance_tokens` and
+    `tyr_pool_stop_take_back_grace_seconds`.
+  - Admission audit events with `settlement: "stopped"` and a `stopCause`.
+  - `stopped` in the `shutdown()` result and in the drain-deadline log line,
+    when `stopOnDrainTimeout` is on.
+- `npm run verify:stop`, part of `release:check`. It checks that nothing
+  changes without a stop policy, then an overrun, a provider's closing usage,
+  a take-back, a stream stopped before its first byte, the token hold after a
+  stop, and a `SIGTERM` shutdown of the built server that stops a request,
+  answers `503` and exits with code 0.
+
+### Fixed
+
+- A streamed request that failed after the provider had answered with
+  headers, but before the first chunk of its reply was written, now gets its
+  error status: `504 idle_timeout`, `504 borrowed_admission_deadline` or
+  `502 upstream_error`. Before, Tyr closed the connection without a status
+  line, because it treated the reply as started as soon as the provider
+  answered. Tyr now writes a streamed reply's status line with its first
+  chunk, which is when it reached the client before as well. A stream that
+  has delivered a chunk is still cut.
+- A streamed request whose output reservation is smaller than
+  `progressiveReconciliation.outputSafetyMarginTokens` no longer holds more
+  tokens than it reserved. Before, its first usage report raised its hold to
+  the whole margin, 256 tokens by default. The difference was counted in
+  `tyr_pool_tokens_overrun_total` and could lift `tyr_pool_tokens_in_flight`
+  above the budget. The margin is now capped at the request's output
+  reservation.
+
+### Compatibility
+
+- Without a `stop` block and without `shutdown.stopOnDrainTimeout`, no request
+  is stopped, `/stats` and `/metrics` have no stop fields or series, and the
+  shutdown result has no `stopped`.
+  - The differences from 0.34.1 are the two fixes above. A streamed request
+    that fails before its first chunk gets a status instead of a closed
+    connection, and the `upstream_failure` diagnostic for it has
+    `afterHeaders: false`. A streamed request with an output reservation
+    below the safety margin holds fewer tokens while it runs, so the pool's
+    overrun, refunded and early-released token counters differ for it.
+  - The 0.34.1 build and this build were driven with the same 19 requests,
+    covering all three provider routes, streaming, rejections, a borrowed-slot
+    deadline, observe mode, runtime limit updates and a bounded drain. With
+    neither kind of streamed request among them, everything they returned and
+    reported matched, apart from ids, timestamps, timings and the version.
+- With a `stop` block:
+  - A pool that starts open starts at revision `max(limitsRevision, 1)`,
+    because revision 0 cannot carry a stop policy. A pool with
+    `limitsRevision` 0 or omitted starts at revision 1, reports it in
+    `x-admission-revision` and `/stats`, and needs revision 2 or higher for
+    its first runtime update. A pool that starts closed, as a Latchflo-managed
+    pool does, keeps its configured revision.
+  - A `stop` field on a runtime limits update is still ignored. Every update
+    gets the pool's configured policy. `Pool.controller.applyLimits` no longer
+    hands a `stop` field to the library either.
+  - A `stop` block is refused with `admissionMode: observe`, and an empty
+    `stop` block is refused.
+  - In Latchflo managed mode, `takeBackGraceMs` also stops the requests still
+    running after a grant has expired. The policy is local configuration:
+    Latchflo does not send it, and nothing new is sent to Latchflo.
+  - An overrun is measured on the request's hold. With progressive
+    reconciliation on, a request is stopped only after its output has overrun
+    by about the size of its reservation. With it off, an input estimate that
+    was too low counts toward the allowance.
+  - A request is stopped for an overrun only when the provider reports the
+    usage before the reply ends. OpenAI's Chat Completions and Responses
+    streams report usage as they end, so their requests are not stopped for
+    their own output.
+  - With an `overrunAllowanceTokens`, a provider's closing usage is no longer
+    a mid-stream report on that pool. It is absent from
+    `tyr.progressiveReconciliation`, and an overrun that only the closing
+    usage shows is not added to `tyr_pool_tokens_overrun_total`. The
+    consumed-token counters include it.
+  - On a pool with a queue, a waiting request takes a stopped request's slot
+    while that request's tokens are still charged. A waiter whose reservation
+    does not fit beside them is rejected with `429 budget_limit` instead of
+    waiting.
+  - `tyr_requests_total` and `tyr_upstream_duration_seconds` gain the
+    `outcome` value `stopped`. `tyr_pool_work_in_flight` and
+    `tyr.restoration.upstreamCapacity.activeAccountingHolds` include stopped
+    requests whose upstream call has not settled.
+  - Admission provenance events carry `limits.stop`.
+- A reply cut by a stop ends without an error event, so a client cannot tell
+  it from a broken connection.
+- Legacy environment mode has no variables for the stop settings.
+- `config/tyr.schema.json` describes the new settings and states their three
+  cross-field rules: `stopOnDrainTimeout: true` needs `drainTimeoutMs`, an
+  overrun allowance needs `inFlightTokenBudget`, and a `stop` block needs
+  `admissionMode: enforce`.
+- TypeScript embedders:
+  - `TyrRequestOutcome` and `TyrAuditSettlement` gain `"stopped"`, and
+    `TyrAdmissionAuditEvent` gains `stopCause`.
+  - `Pool.drain` and `Pools.drain` take an optional second argument,
+    `{ stopOnTimeout }`.
+  - `PoolConfig` gains `stop`, `Pool` gains `stopPolicy`, `GatewayOptions`
+    gains `shutdownStopOnDrainTimeout`, and `TyrPoolStats["tyr"]` gains
+    `stop`.
+  - `pools.ts` exports `StopPolicyConfig`, `PoolDrainOptions`, `STOP_CAUSES`
+    and `MAX_TAKE_BACK_GRACE_MS`.
+  - The usage callback of `Adapter.createStreamExtractor` and of the three
+    stream extractors receives a second argument, `final`, which is true for
+    usage sent with the end of a reply. `sse.ts` exports the `UsageListener`
+    type, and `responses-state.ts` exports `streamResponseFinished`.
+- No dependency change. `async-bulkhead-llm` stays at 3.18.0.
+
 ## [0.34.1] - 2026-11-23
 
 ### Changed

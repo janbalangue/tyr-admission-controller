@@ -7,7 +7,11 @@
  */
 import type { LLMRequest, TokenUsage } from "async-bulkhead-llm";
 import { createAdmissionRequest } from "./admission.js";
-import { createSSEUsageExtractor, type UsageObservation } from "./sse.js";
+import {
+  createSSEUsageExtractor,
+  type UsageListener,
+  type UsageObservation,
+} from "./sse.js";
 import { createOpenAISSEUsageExtractor } from "./sse-openai.js";
 import { createOpenAIResponsesSSEUsageExtractor } from "./sse-responses.js";
 import {
@@ -69,7 +73,7 @@ export type Adapter = {
    * before the chunk holding it is forwarded.
    */
   createStreamExtractor(
-    onUsage: (usage: UsageObservation) => void,
+    onUsage: UsageListener,
     onResponse?: (response: Record<string, unknown>, eventType: unknown) => void,
   ): StreamExtractor;
 };

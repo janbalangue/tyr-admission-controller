@@ -31,15 +31,26 @@ export type ProgressiveUsageReconcilerOptions = {
  * other call still reports cumulative usage but reuses the last applied
  * floor, leaving the hold unchanged.
  *
- * The retained floor is `max(outputSafetyMarginTokens, maxOutput - output)`:
- * once known-remaining output drops below the safety margin, the margin
- * itself becomes the floor until final release.
+ * The retained floor is `max(safetyMargin, maxOutput - output)`: once
+ * known-remaining output drops below the safety margin, the margin itself
+ * becomes the floor until final release.
+ *
+ * The safety margin is `outputSafetyMarginTokens`, capped at the request's
+ * output reservation. It keeps part of the output the request reserved, so
+ * it cannot be larger than that reservation. Uncapped, a request that
+ * reserved fewer tokens than the margin would hold the whole margin after its
+ * first report: more than it was admitted with, which the pool counts as
+ * overrun and which, under a stop policy, would stop a request that used
+ * nothing beyond its reservation.
  */
 export function createProgressiveUsageReconciler(
   options: ProgressiveUsageReconcilerOptions,
 ): { reportUsage(usage: TokenUsage): ProgressiveUsageResult } {
-  const { reservation, reportUsage, updateStepTokens, outputSafetyMarginTokens } =
-    options;
+  const { reservation, reportUsage, updateStepTokens } = options;
+  const outputSafetyMarginTokens =
+    reservation === null
+      ? options.outputSafetyMarginTokens
+      : Math.min(options.outputSafetyMarginTokens, reservation.maxOutput);
   let lastAppliedRemaining: number | undefined;
   let lastHeld: number | undefined = reservation?.reserved;
 

@@ -5,6 +5,7 @@
  * verify against the live API before production use — see README):
  *   - `message_start` event carries `message.usage.input_tokens`
  *   - `message_delta` events carry cumulative `usage.output_tokens`
+ *   - the `message_delta` that ends the message carries `delta.stop_reason`
  *
  * The parser is passthrough-safe: it never modifies bytes, only observes.
  * Unknown or malformed events are ignored.
@@ -14,9 +15,14 @@ export type UsageObservation = {
   output: number;
 };
 
-export function createSSEUsageExtractor(
-  onUsage: (usage: UsageObservation) => void,
-) {
+/**
+ * Receives each cumulative usage observation of a stream. `final` is true
+ * when the provider sent it as part of ending the reply: the work it counts
+ * is done, and no more output follows.
+ */
+export type UsageListener = (usage: UsageObservation, final: boolean) => void;
+
+export function createSSEUsageExtractor(onUsage: UsageListener) {
   let buffer = "";
   let input = 0;
   let output = 0;
@@ -39,7 +45,7 @@ export function createSSEUsageExtractor(
       if (typeof it === "number" && Number.isFinite(it) && it >= 0) {
         input = Math.floor(it);
         sawAny = true;
-        onUsage({ input, output });
+        onUsage({ input, output }, false);
       }
     } else if (evt["type"] === "message_delta") {
       const usage = evt["usage"] as Record<string, unknown> | undefined;
@@ -47,7 +53,9 @@ export function createSSEUsageExtractor(
       if (typeof ot === "number" && Number.isFinite(ot) && ot >= 0) {
         output = Math.max(output, Math.floor(ot));
         sawAny = true;
-        onUsage({ input, output });
+        const delta = evt["delta"] as Record<string, unknown> | null | undefined;
+        // A stop reason means the model has stopped generating.
+        onUsage({ input, output }, typeof delta?.["stop_reason"] === "string");
       }
     }
   }

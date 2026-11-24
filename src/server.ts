@@ -1,8 +1,10 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import {
+  LLMAdmissionStoppedError,
   LLMBorrowedConcurrencyDeadlineError,
   LLMBulkheadRejectedError,
+  type LLMAdmissionStopCause,
   type LLMRejectReason,
   type LLMPriority,
   type TokenUsage,
@@ -130,6 +132,15 @@ export type GatewayOptions = {
    */
   shutdownDrainTimeoutMs?: number;
   /**
+   * Stop every request still running when `shutdownDrainTimeoutMs` elapses.
+   * A stopped request that has been sent no part of its reply gets `503
+   * admission_stopped` with cause `drain_deadline`, a reply already under way
+   * is cut, and each is counted and audited as stopped. Tyr then closes the
+   * remaining connections as before. Requires `shutdownDrainTimeoutMs`.
+   * Default: false, which closes connections without stopping anything.
+   */
+  shutdownStopOnDrainTimeout?: boolean;
+  /**
    * Resolve admission priority from an authenticated/trusted request context.
    * This is the preferred way to grant high-priority capacity.
    */
@@ -233,6 +244,17 @@ function rejectStatus(reason: LLMRejectReason): number {
       return 504;
     default:
       return 429; // budget_limit, concurrency_limit, queue_limit, aborted
+  }
+}
+
+function stopMessage(cause: LLMAdmissionStopCause): string {
+  switch (cause) {
+    case "overrun":
+      return "Tyr stopped this admitted request because token usage in its pool grew past what the pool's stop policy allows";
+    case "limits":
+      return "Tyr stopped this admitted request because its pool's limits were lowered and the grace period for running work ended";
+    case "drain_deadline":
+      return "Tyr stopped this admitted request because this instance is shutting down and its drain deadline passed";
   }
 }
 
@@ -459,6 +481,20 @@ function validateGatewayOptions(opts: GatewayOptions): void {
     0,
   );
   if (
+    opts.shutdownStopOnDrainTimeout !== undefined &&
+    typeof opts.shutdownStopOnDrainTimeout !== "boolean"
+  ) {
+    throw new Error("shutdownStopOnDrainTimeout must be a boolean");
+  }
+  if (
+    opts.shutdownStopOnDrainTimeout === true &&
+    opts.shutdownDrainTimeoutMs === undefined
+  ) {
+    throw new Error(
+      "shutdownStopOnDrainTimeout requires shutdownDrainTimeoutMs",
+    );
+  }
+  if (
     opts.resolvePriority !== undefined &&
     typeof opts.resolvePriority !== "function"
   ) {
@@ -596,6 +632,7 @@ export function createGateway(opts: GatewayOptions) {
     opts.maxRequestBodyBytes ?? DEFAULT_MAX_REQUEST_BODY_BYTES;
   const maxOutputTokens = opts.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   const shutdownDrainTimeoutMs = opts.shutdownDrainTimeoutMs;
+  const shutdownStopOnDrainTimeout = opts.shutdownStopOnDrainTimeout === true;
   const resolvePriority = opts.resolvePriority;
   const resolveAdmissionClass = opts.resolveAdmissionClass;
   const trustPriorityHeader = opts.trustPriorityHeader ?? false;
@@ -998,10 +1035,14 @@ export function createGateway(opts: GatewayOptions) {
       }
 
       const wantsStream = adapter.isStreamRequested(body);
+      // Whether a usage report can stop a request of this pool.
+      const stopsOverruns =
+        pool.stopPolicy?.overrunAllowanceTokens !== undefined;
       const abort = new AbortController();
       const admissionSignal: AbortSignal = abort.signal;
       let failureKind:
         | "borrowed_admission_deadline"
+        | "stopped"
         | "response_timeout"
         | "idle_timeout"
         | "client_disconnect"
@@ -1031,6 +1072,7 @@ export function createGateway(opts: GatewayOptions) {
         settlement: TyrAuditSettlement,
         usage?: TokenUsage,
         restoration?: TyrAdmissionAuditEvent["restoration"],
+        stopCause?: LLMAdmissionStopCause,
       ): void => {
         if (admissionAudit === undefined) return;
         telemetry.emitAdmissionAudit({
@@ -1038,6 +1080,7 @@ export function createGateway(opts: GatewayOptions) {
           settlement,
           ...(usage === undefined ? {} : { usage }),
           ...(restoration === undefined ? {} : { restoration }),
+          ...(stopCause === undefined ? {} : { stopCause }),
         });
         admissionAudit = undefined;
       };
@@ -1148,16 +1191,18 @@ export function createGateway(opts: GatewayOptions) {
 
             const upstreamStartedAt = performance.now();
             let upstreamMetricOutcome = "upstream_error";
-            const noteBorrowedDeadline = (): void => {
-              if (
-                signal?.aborted === true &&
-                signal.reason instanceof LLMBorrowedConcurrencyDeadlineError
-              ) {
+            // The library aborts this signal when it takes the request's slot
+            // back. Its reason says which of the two ways that happened.
+            const noteEngineAbort = (): void => {
+              if (signal?.aborted !== true) return;
+              if (signal.reason instanceof LLMBorrowedConcurrencyDeadlineError) {
                 failureKind = "borrowed_admission_deadline";
+              } else if (signal.reason instanceof LLMAdmissionStoppedError) {
+                failureKind = "stopped";
               }
             };
-            if (signal?.aborted === true) noteBorrowedDeadline();
-            else signal?.addEventListener("abort", noteBorrowedDeadline, { once: true });
+            if (signal?.aborted === true) noteEngineAbort();
+            else signal?.addEventListener("abort", noteEngineAbort, { once: true });
             try {
               // Response timeout bounds how long fetch waits for upstream
               // response headers. It is cleared as soon as headers arrive.
@@ -1191,17 +1236,37 @@ export function createGateway(opts: GatewayOptions) {
               );
 
               if (wantsStream && upstreamRes.body) {
-                res.writeHead(upstreamRes.status, {
-                  "content-type":
-                    upstreamRes.headers.get("content-type") ??
-                    "text/event-stream",
-                  "cache-control": "no-cache",
-                  connection: "keep-alive",
-                });
+                // The reply's head is written with its first chunk, not here.
+                // Node sends a head with the first body bytes either way, so
+                // the client sees the same thing. But until those bytes are
+                // written the client has received nothing, and a failure or
+                // a stop in that time can still be answered with a status of
+                // its own instead of a closed connection.
+                const replyStatus = upstreamRes.status;
+                const replyContentType =
+                  upstreamRes.headers.get("content-type") ?? "text/event-stream";
+                const writeReplyHead = (): void => {
+                  if (res.headersSent) return;
+                  res.writeHead(replyStatus, {
+                    "content-type": replyContentType,
+                    "cache-control": "no-cache",
+                    connection: "keep-alive",
+                  });
+                };
+                // Set when a usage report of this stream stops this request.
+                let stoppedByOwnReport = false;
                 const extractor = adapter.createStreamExtractor(
-                  (usage) => {
+                  (usage, final) => {
                     observedUsage = usage;
-                    ctx?.reportUsage(usage);
+                    // Usage a provider sends as it ends a reply counts work
+                    // that is already done. On a pool that stops overruns it
+                    // is applied when the request completes: reported now, it
+                    // could only cut a reply the client is about to have in
+                    // full.
+                    if (final && stopsOverruns) return;
+                    if (ctx?.reportUsage(usage).stopped === true) {
+                      stoppedByOwnReport = true;
+                    }
                   },
                   // A stream can stop early, so only an event that shows
                   // the response is finished may create a record.
@@ -1229,6 +1294,13 @@ export function createGateway(opts: GatewayOptions) {
                   for await (const chunk of upstreamRes.body) {
                     armIdleTimer();
                     extractor.push(decoder.decode(chunk, { stream: true }));
+                    if (stoppedByOwnReport) {
+                      // A usage report in this chunk stopped the request, and
+                      // its caller has already been rejected with the stop.
+                      // Nothing more of the reply is written.
+                      throw new Error("request stopped while streaming");
+                    }
+                    writeReplyHead();
                     if (!res.write(chunk)) {
                       await waitForDrain(res, clientStallTimeoutMs, () => {
                         failureKind = "client_stall";
@@ -1239,6 +1311,8 @@ export function createGateway(opts: GatewayOptions) {
                   if (idleTimer !== undefined) clearTimeout(idleTimer);
                 }
 
+                // An upstream reply with no body bytes still needs its head.
+                writeReplyHead();
                 res.end();
                 observedUsage = extractor.current();
                 return { usage: observedUsage, status: upstreamRes.status };
@@ -1275,7 +1349,7 @@ export function createGateway(opts: GatewayOptions) {
               }
               return { usage: observedUsage, status: upstreamRes.status };
             } finally {
-              signal?.removeEventListener("abort", noteBorrowedDeadline);
+              signal?.removeEventListener("abort", noteEngineAbort);
               if (failureKind !== undefined) {
                 upstreamMetricOutcome = failureKind;
               }
@@ -1343,6 +1417,41 @@ export function createGateway(opts: GatewayOptions) {
               message: `borrowed admission slot deadline expired after ${err.deadlineMs}ms`,
               resource: "admission_slot",
               releaseMechanism: "deadline_abandonment",
+              localSlotReleased: true,
+              upstreamCancellation: "requested",
+              upstreamReclamation: "unverified",
+              resources: err.resources,
+            },
+          });
+          return;
+        }
+        if (err instanceof LLMAdmissionStoppedError) {
+          failureKind = "stopped";
+          // Drop the upstream call. The library has already aborted the
+          // callback's signal when the pool had a stop policy at admission. A
+          // request admitted without one, and stopped by a drain, is only
+          // rejected, so it is aborted here. The request's tokens come back
+          // when the callback has ended, which the abort brings about.
+          abort.abort(err);
+          recordRequest("stopped");
+          emitAdmissionAudit("stopped", observedUsage, undefined, err.cause);
+
+          if (res.headersSent) {
+            // The client has part of the reply, so it can only be cut.
+            res.destroy();
+            return;
+          }
+          res.setHeader("x-admission-reason", "stopped");
+          res.setHeader("x-admission-stop-cause", err.cause);
+          if (err.cause === "drain_deadline") {
+            res.setHeader("connection", "close");
+          }
+          sendJson(res, 503, {
+            error: {
+              type: "admission_stopped",
+              cause: err.cause,
+              message: stopMessage(err.cause),
+              pool: pool.name,
               localSlotReleased: true,
               upstreamCancellation: "requested",
               upstreamReclamation: "unverified",
@@ -1636,6 +1745,8 @@ export function createGateway(opts: GatewayOptions) {
    * With `shutdownDrainTimeoutMs`, the library returns an outstanding-work
    * snapshot at the deadline; Tyr then closes remaining connections so process
    * termination is bounded instead of waiting forever on a dead stream.
+   * With `shutdownStopOnDrainTimeout` as well, requests still running at the
+   * deadline are stopped first and answered before the connections close.
    */
   function shutdown(): Promise<PoolsDrainResult> {
     if (shuttingDown) return shuttingDown;
@@ -1651,8 +1762,20 @@ export function createGateway(opts: GatewayOptions) {
 
     shuttingDown = (async () => {
       try {
-        const drainResult = await pools.drain(shutdownDrainTimeoutMs);
+        const drainResult = await pools.drain(
+          shutdownDrainTimeoutMs,
+          shutdownStopOnDrainTimeout ? { stopOnTimeout: true } : {},
+        );
         if (!drainResult.drained) {
+          if ((drainResult.stopped ?? 0) > 0) {
+            // A stop rejects its handler a few microtasks later, and the
+            // handler then answers `503` or cuts its stream. One turn of the
+            // event loop lets every handler get there before the connections
+            // close. As the promise chains are built today each handler is
+            // already a microtask or two ahead of this point; the turn keeps
+            // the answers from depending on that.
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          }
           server.closeAllConnections();
         }
         await serverClosed;

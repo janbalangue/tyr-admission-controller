@@ -79,8 +79,11 @@ function handleShutdownSignal(signal: string): void {
   shutdown()
     .then((result) => {
       if (!result.drained) {
+        // `stopped` is reported only when shutdown.stopOnDrainTimeout is on.
         console.warn(
-          `shutdown drain deadline reached inFlight=${result.inFlight} pending=${result.pending}`,
+          `shutdown drain deadline reached inFlight=${result.inFlight} pending=${result.pending}${
+            result.stopped === undefined ? "" : ` stopped=${result.stopped}`
+          }`,
         );
       }
       console.log("shutdown complete");

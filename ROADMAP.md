@@ -2,8 +2,8 @@
 
 Tyr is an LLM admission controller. Its purpose is to prevent concurrent AI workloads from overcommitting finite provider or inference capacity by reserving token capacity before upstream execution begins.
 
-This roadmap prioritizes the shortest path from the current `v0.34.1`
-response-memory release to a commercially credible product. It
+This roadmap prioritizes the shortest path from the current `v0.35.0`
+release, which can stop admitted requests, to a commercially credible product. It
 assumes one experienced TypeScript/backend engineer, automated tests and
 documentation for every milestone, and no custom management UI before
 `v1.0.0`.
@@ -25,10 +25,14 @@ The initial commercial promise is:
 5. **Control cardinality.** Tenant, application, model, and request identifiers must not create unbounded metric labels or bulkhead instances.
 6. **Preserve a small data plane.** Authentication, admission, forwarding, and telemetry belong in the gateway; historical analytics and fleet coordination may live outside it.
 
-## Current baseline: v0.34.1
+## Current baseline: v0.35.0
 
 The current release provides:
 
+- Opt-in stopping of admitted requests: a request whose token hold overruns
+  its reservation, requests left above lowered limits after a grace period,
+  and requests still running at the shutdown drain deadline. A stop returns
+  the local slot at once and drops the upstream call.
 - Opt-in response memory for OpenAI Responses follow-ups: Tyr records the
   provider-reported size of each Responses reply, a `previous_response_id`
   follow-up reserves its own estimate plus that size, and a follow-up to a
@@ -51,7 +55,8 @@ The current release provides:
 - Optional wall-clock leases for borrowed local admission slots, with split
   concurrency/token accounting and resource-specific restoration evidence.
 - Tyr-local all-or-nothing runtime updates across named pools, with stale
-  revision protection and shrink-by-attrition semantics.
+  revision protection and shrink-by-attrition semantics, or a bounded shrink
+  when the pool has a take-back grace period.
 - First-class Latchflo-managed operation with registration, persisted credentials,
   readiness, expiring grants, and fail-closed zero-capacity startup.
 - Automatic per-pool and bounded per-admission-class demand snapshots on
@@ -74,7 +79,8 @@ The current release provides:
 - Fail-fast concurrent-request and token-budget admission with priority reserves.
 - Stable admission IDs, streaming usage correction, transport backpressure, and
   response, idle, and client-stall timeouts.
-- Bounded graceful drain with outstanding-work reporting.
+- Bounded graceful drain with outstanding-work reporting, and an option to
+  stop what is still running at the deadline.
 - Strict startup validation, YAML configuration, offline validation, Docker and
   Compose assets, and expanded local policy statistics.
 - Native bounded-cardinality Prometheus metrics, optional structured admission
@@ -87,8 +93,8 @@ The current release provides:
   versioned fleet topology that Tyr can apply without restart; standalone routing
   retains startup-configured peers.
 - Observed-completion-based retry hints for capacity rejection responses.
-- Explicit upstream-cancellation uncertainty: deadline-based local slot release
-  is never presented as provider-capacity reclamation.
+- Explicit upstream-cancellation uncertainty: neither a deadline-based local
+  slot release nor a stop is presented as provider-capacity reclamation.
 
 Known commercial limitations include a single-controller SQLite control plane, no OTLP exporter or durable audit store, direct-JWKS-only identity configuration, limited protocol coverage, and no hardened multi-region deployment package.
 
@@ -514,6 +520,25 @@ Outcome:
 - Tyr keeps its pre-upstream token-reservation guarantee explicit rather than
   pretending unseen provider-managed state can be estimated safely.
 
+### v0.35.0 — Stopping admitted requests — shipped 2026-11-23
+
+- Added an opt-in per-pool `stop` block. `overrunAllowanceTokens` stops a request whose token hold grows past its reservation, and `takeBackGraceMs` stops the requests a limits update left above the new limits once the grace period ends.
+- Added `shutdown.stopOnDrainTimeout`, which stops the requests still running at the drain deadline before the connections close.
+- A stopped request that has been sent no part of its reply gets `503 admission_stopped` with its cause; a reply under way is cut. The slot returns at once, the upstream call is dropped, and the tokens return when that call has ended locally.
+- The usage a provider reports only as a reply ends never stops that reply.
+- Tyr states the pool's policy on every limits update, including Latchflo grants and the zero-capacity revision applied when a grant expires.
+- Added stop counters to `/stats` and `/metrics`, a `stopped` settlement with its cause on audit events, and `verify:stop` in `release:check`.
+- Fixed the progressive safety margin, which could raise the hold of a request with a small output reservation above what the request reserved.
+- Fixed streamed requests that failed before their first chunk: they now get their error status instead of a closed connection.
+
+Outcome:
+
+- A pool can bound how long a shrink takes and what a shutdown leaves running, instead of waiting for requests to finish.
+- A pool can stop a request that overruns, where the provider reports usage while the reply is still streaming. OpenAI's streams report it only at the end, so their requests are not stopped for their own output.
+- A stop is reported as a local decision. Tyr does not claim the provider stopped work.
+
+Not in this release: a stop policy distributed by Latchflo, an error event on a reply cut by a stop, queued requests kept waiting while a stopped request's tokens are still charged, and background responses.
+
 ### v0.34.1 — async-bulkhead-llm 3.18.0 — shipped 2026-11-23
 
 - Updated the vendored `async-bulkhead-llm` from 3.17.0 to 3.18.0, which also brings in the internal restructuring of 3.17.1.
@@ -584,7 +609,7 @@ Outcome:
 
 ### v1.0.0 — Supported production release
 
-**Timing:** After v0.34.1 and sufficient design-partner validation.
+**Timing:** After v0.35.0 and sufficient design-partner validation.
 **Goal:** Provide a stable, documented, supportable product for production design partners.
 
 Planned work:
