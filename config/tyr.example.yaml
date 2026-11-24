@@ -30,6 +30,11 @@ shutdown:
   # outstanding work and closes remaining HTTP connections. Omit to wait
   # indefinitely, preserving the previous behavior.
   drainTimeoutMs: 30000
+  # true stops the requests still running at the deadline before the
+  # connections close. A request that has been sent no part of its reply gets
+  # 503 admission_stopped, a reply under way is cut, and each is counted and
+  # audited as stopped. Requires drainTimeoutMs. Default: false.
+  stopOnDrainTimeout: false
 
 priority:
   # Legacy trusted-proxy fallback. Ignored for provider requests when
@@ -150,6 +155,25 @@ pools:
       minCorrection: 0.5
       maxCorrection: 2
       maxModels: 64
+    # Optional stopping of admitted requests. Nothing is stopped without this
+    # block, and it cannot be combined with admissionMode: observe. A stopped
+    # request gets 503 admission_stopped, or has its reply cut once part of
+    # the reply has been written. Its concurrency slot returns at once and
+    # Tyr drops the upstream call; that does not prove the provider stopped
+    # work. Tyr states this policy on every limits update, and a pool that
+    # starts open with it starts at revision max(limitsRevision, 1).
+    # stop:
+    #   # Tokens a request's hold may grow above its reservation before the
+    #   # request is stopped. Requires inFlightTokenBudget. The hold, not the
+    #   # usage, is measured: with progressiveReconciliation on, a hold shrinks
+    #   # as the reply streams, so it passes its reservation only after output
+    #   # has overrun by about the size of the reservation. Usage a provider
+    #   # reports only as a reply ends never stops that reply, which is all
+    #   # the usage OpenAI's streams report.
+    #   overrunAllowanceTokens: 2000
+    #   # After a limits update, requests it left above the new limits are
+    #   # stopped once this many milliseconds have passed.
+    #   takeBackGraceMs: 5000
     # Optional bounded service classes. Trusted identity claims are mapped to
     # fixed class IDs; raw tenant/application IDs never become bulkhead keys or
     # Prometheus labels. First matching rule wins. Selector categories within

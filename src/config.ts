@@ -9,7 +9,7 @@ import {
   type JwtRsaAlgorithm,
   type TyrIdentityOptions,
 } from "./identity.js";
-import type { PoolConfig } from "./pools.js";
+import { MAX_TAKE_BACK_GRACE_MS, type PoolConfig } from "./pools.js";
 import { MAX_RESPONSES_STATE_MAX_ENTRIES } from "./responses-state.js";
 import {
   BORROWED_ADMISSION_SLOT_RELEASE_MECHANISM,
@@ -1251,6 +1251,7 @@ function normalizePool(value: unknown, index: number): PoolConfig {
       "adaptiveEstimation",
       "progressiveReconciliation",
       "admissionClasses",
+      "stop",
     ],
     field,
   );
@@ -1458,6 +1459,47 @@ function normalizePool(value: unknown, index: number): PoolConfig {
     );
   }
 
+  const stopValue = optionalObjectValue(pool, "stop", `${field}.stop`);
+  let stop: PoolConfig["stop"];
+  if (stopValue !== undefined) {
+    assertKnownKeys(
+      stopValue,
+      ["overrunAllowanceTokens", "takeBackGraceMs"],
+      `${field}.stop`,
+    );
+    const overrunAllowanceTokens = optionalInteger(
+      stopValue,
+      "overrunAllowanceTokens",
+      `${field}.stop.overrunAllowanceTokens`,
+      { min: 0 },
+    );
+    const takeBackGraceMs = optionalInteger(
+      stopValue,
+      "takeBackGraceMs",
+      `${field}.stop.takeBackGraceMs`,
+      { min: 0, max: MAX_TAKE_BACK_GRACE_MS },
+    );
+    if (overrunAllowanceTokens === undefined && takeBackGraceMs === undefined) {
+      throw new Error(
+        `${field}.stop must set overrunAllowanceTokens or takeBackGraceMs`,
+      );
+    }
+    if (overrunAllowanceTokens !== undefined && budget === undefined) {
+      throw new Error(
+        `${field}.stop.overrunAllowanceTokens requires ${field}.inFlightTokenBudget`,
+      );
+    }
+    if ((admissionMode ?? "enforce") !== "enforce") {
+      throw new Error(
+        `${field}.stop requires ${field}.admissionMode to be enforce; an observe pool does not stop requests`,
+      );
+    }
+    stop = {
+      ...(overrunAllowanceTokens !== undefined ? { overrunAllowanceTokens } : {}),
+      ...(takeBackGraceMs !== undefined ? { takeBackGraceMs } : {}),
+    };
+  }
+
   return {
     name,
     modelPrefixes,
@@ -1478,6 +1520,7 @@ function normalizePool(value: unknown, index: number): PoolConfig {
       ? { progressiveReconciliation }
       : {}),
     ...(admissionClasses === undefined ? {} : { admissionClasses }),
+    ...(stop === undefined ? {} : { stop }),
   };
 }
 
@@ -1555,13 +1598,30 @@ function normalizeFileConfiguration(
   );
 
   const shutdown = optionalObjectValue(root, "shutdown", "shutdown") ?? {};
-  assertKnownKeys(shutdown, ["drainTimeoutMs"], "shutdown");
+  assertKnownKeys(
+    shutdown,
+    ["drainTimeoutMs", "stopOnDrainTimeout"],
+    "shutdown",
+  );
   const shutdownDrainTimeoutMs = optionalInteger(
     shutdown,
     "drainTimeoutMs",
     "shutdown.drainTimeoutMs",
     { min: 0 },
   );
+  const shutdownStopOnDrainTimeout = optionalBoolean(
+    shutdown,
+    "stopOnDrainTimeout",
+    "shutdown.stopOnDrainTimeout",
+  );
+  if (
+    shutdownStopOnDrainTimeout === true &&
+    shutdownDrainTimeoutMs === undefined
+  ) {
+    throw new Error(
+      "shutdown.stopOnDrainTimeout requires shutdown.drainTimeoutMs",
+    );
+  }
 
   const priority = optionalObjectValue(root, "priority", "priority") ?? {};
   assertKnownKeys(priority, ["trustHeader"], "priority");
@@ -1668,6 +1728,9 @@ function normalizeFileConfiguration(
       ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
       ...(shutdownDrainTimeoutMs !== undefined
         ? { shutdownDrainTimeoutMs }
+        : {}),
+      ...(shutdownStopOnDrainTimeout !== undefined
+        ? { shutdownStopOnDrainTimeout }
         : {}),
       trustPriorityHeader,
       ...(identity === undefined ? {} : { identity }),

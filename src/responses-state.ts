@@ -210,12 +210,22 @@ export function recordableStreamResponse(
   eventType: unknown,
 ): { id: string; tokens: number } | undefined {
   if (!isPlainObject(value)) return undefined;
-  const status = value["status"];
-  const finished =
-    status === undefined
-      ? typeof eventType === "string" && FINAL_RESPONSE_EVENTS.has(eventType)
-      : typeof status === "string" && FINAL_RESPONSE_STATUSES.has(status);
-  return finished ? idAndTokens(value) : undefined;
+  return streamResponseFinished(value, eventType) ? idAndTokens(value) : undefined;
+}
+
+/**
+ * Whether a stream event shows its response is finished: a final `status`,
+ * or, when the response has no status (or the event has no response object
+ * at all), a final event type.
+ */
+export function streamResponseFinished(
+  response: Record<string, unknown> | undefined,
+  eventType: unknown,
+): boolean {
+  const status = response?.["status"];
+  return status === undefined
+    ? typeof eventType === "string" && FINAL_RESPONSE_EVENTS.has(eventType)
+    : typeof status === "string" && FINAL_RESPONSE_STATUSES.has(status);
 }
 
 function serializeRecord(entry: Entry): string {

@@ -14,12 +14,27 @@
  * here — usage (if present at all) only ever arrives once, on the final
  * chunk. The parser is passthrough-safe: it never modifies bytes, only
  * observes. Unknown or malformed events are ignored.
+ *
+ * Some compatible servers attach cumulative usage to every chunk. A usage
+ * observation is reported as final when its chunk has no choice still being
+ * generated: no choices at all, as on the documented usage chunk, or a
+ * choice with a `finish_reason`.
  */
-import type { UsageObservation } from "./sse.js";
+import type { UsageListener, UsageObservation } from "./sse.js";
 
-export function createOpenAISSEUsageExtractor(
-  onUsage: (usage: UsageObservation) => void,
-) {
+/** Whether a chunk that carries usage belongs to the end of the reply. */
+function endsReply(chunk: Record<string, unknown>): boolean {
+  const choices = chunk["choices"];
+  if (!Array.isArray(choices) || choices.length === 0) return true;
+  return choices.some(
+    (choice) =>
+      choice !== null &&
+      typeof choice === "object" &&
+      typeof (choice as Record<string, unknown>)["finish_reason"] === "string",
+  );
+}
+
+export function createOpenAISSEUsageExtractor(onUsage: UsageListener) {
   let buffer = "";
   let input = 0;
   let output = 0;
@@ -51,7 +66,8 @@ export function createOpenAISSEUsageExtractor(
     }
     if (changed) {
       sawAny = true;
-      onUsage({ input, output });
+      const usageNow: UsageObservation = { input, output };
+      onUsage(usageNow, endsReply(evt));
     }
   }
 

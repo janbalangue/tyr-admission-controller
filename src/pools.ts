@@ -7,6 +7,7 @@ import {
   type LLMBorrowedConcurrencyAbandonCause,
   type LLMAdmissionLimits,
   type LLMAdmissionMode,
+  type LLMAdmissionStopCause,
   type LLMApplyLimitsResult,
   type LLMDrainResult,
   type LLMObserveStats,
@@ -116,6 +117,41 @@ export type ProgressiveReconciliationConfig = {
   outputSafetyMarginTokens?: number;
 };
 
+/** Every cause a stop can have, in the order Tyr reports them. */
+export const STOP_CAUSES = [
+  "overrun",
+  "limits",
+  "drain_deadline",
+] as const satisfies readonly LLMAdmissionStopCause[];
+
+/** Largest delay a timer honors; the library's bound for `takeBackGraceMs`. */
+export const MAX_TAKE_BACK_GRACE_MS = 2_147_483_647;
+
+/**
+ * When Tyr may stop a request it has already admitted. Nothing is stopped
+ * unless a field here is set.
+ *
+ * A stop returns the request's concurrency slot at once and aborts the
+ * signal its callback was given. The request's tokens stay charged until the
+ * callback settles. The gateway's callback settles as soon as its upstream
+ * call has been dropped; neither step shows that the provider stopped work.
+ */
+export type StopPolicyConfig = {
+  /**
+   * Tokens a request's hold may grow above its reservation. One token more
+   * stops the request. While this is set, a usage report that leaves the pool
+   * above its token budget, or a class above its token ceiling, also stops
+   * requests until the rest fit. Requires `budget`.
+   */
+  overrunAllowanceTokens?: number;
+  /**
+   * Milliseconds after a limits update before requests that the update left
+   * above the new limits are stopped. Requests that finish within it are left
+   * alone, and a newer update restarts it.
+   */
+  takeBackGraceMs?: number;
+};
+
 export type PoolAdmissionDecisionTiming = {
   readonly pool: string;
   readonly outcome: "admitted" | "rejected";
@@ -165,6 +201,13 @@ export type PoolConfig = {
   progressiveReconciliation?: ProgressiveReconciliationConfig;
   /** Bounded identity-aware capacity classes within this physical pool. */
   admissionClasses?: AdmissionClassesConfig;
+  /**
+   * Opt-in stopping of admitted requests. Tyr states this policy on every
+   * limits snapshot it applies to the pool, because the library does not carry
+   * one over from the previous revision. A pool that starts open applies it at
+   * startup, at revision `max(initialRevision, 1)`.
+   */
+  stop?: StopPolicyConfig;
 };
 
 export type AdmissionPreparation = {
@@ -271,6 +314,18 @@ export type TyrPoolStats = LLMStats & {
     };
     /** Response memory counters. Present only when `responsesState` is configured. */
     responsesState?: ResponsesStatePoolStats;
+    /**
+     * Stopped requests. Present when the pool has a stop policy, and on any
+     * pool once one of its requests has been stopped.
+     */
+    stop?: {
+      /** The pool's configured policy. Absent on a pool without one. */
+      policy?: Readonly<StopPolicyConfig>;
+      /** Admitted requests stopped so far. */
+      stopped: number;
+      /** The same count split by cause; every cause is listed. */
+      stoppedByCause: Readonly<Record<LLMAdmissionStopCause, number>>;
+    };
   };
 };
 
@@ -287,6 +342,8 @@ export type PoolController = {
 export type Pool = {
   name: string;
   mode: AdmissionMode;
+  /** The pool's configured stop policy. Absent when it has none. */
+  stopPolicy?: Readonly<StopPolicyConfig>;
   controller: PoolController;
   /** Exact immutable reservation preview used by capacity-aware routing. */
   estimate(request: LLMRequest): LLMReservationEstimate | null;
@@ -319,8 +376,17 @@ export type Pool = {
    * Waits for base concurrency and final LLM token settlement. After a
    * borrowed slot deadline, an omitted timeout can remain pending until the
    * detached callback settles; pass a timeout to bound the wait.
+   *
+   * With `stopOnTimeout`, every request still running at the deadline is
+   * stopped with cause `drain_deadline`, and the result reports how many.
+   * It requires `timeoutMs`.
    */
-  drain(timeoutMs?: number): Promise<LLMDrainResult>;
+  drain(timeoutMs?: number, options?: PoolDrainOptions): Promise<LLMDrainResult>;
+};
+
+export type PoolDrainOptions = {
+  /** Stop whatever is still running when `timeoutMs` elapses. */
+  stopOnTimeout?: boolean;
 };
 
 export type PoolsDrainResult = LLMDrainResult & {
@@ -367,9 +433,10 @@ export type Pools = {
   close(): void;
   /**
    * Stops admission and waits for base concurrency plus final LLM token
-   * settlement, optionally with a bound.
+   * settlement, optionally with a bound. With `stopOnTimeout`, requests still
+   * running at the deadline are stopped, and `stopped` is their total.
    */
-  drain(timeoutMs?: number): Promise<PoolsDrainResult>;
+  drain(timeoutMs?: number, options?: PoolDrainOptions): Promise<PoolsDrainResult>;
 };
 
 function assertNonEmptyString(value: unknown, field: string): asserts value is string {
@@ -404,6 +471,88 @@ function assertOptionalNumberRange(
   if (opts.max !== undefined && value > opts.max) {
     throw new Error(`${field} must be <= ${opts.max}`);
   }
+}
+
+/**
+ * Validates a pool's stop policy and returns a frozen copy. Each supplied
+ * property is read once, so an accessor cannot return one value here and
+ * another when the policy is stated on a limits snapshot.
+ */
+function normalizeStopPolicy(
+  value: StopPolicyConfig,
+  field: string,
+  /** The budget field to name in the error when the pool has no budget. */
+  missingBudgetField: string | undefined,
+): Readonly<StopPolicyConfig> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${field} must be an object`);
+  }
+  for (const property of Object.keys(value)) {
+    if (
+      property !== "overrunAllowanceTokens" &&
+      property !== "takeBackGraceMs"
+    ) {
+      throw new Error(
+        `${field} contains unknown property ${JSON.stringify(property)}`,
+      );
+    }
+  }
+  const overrunAllowanceTokens = value.overrunAllowanceTokens;
+  const takeBackGraceMs = value.takeBackGraceMs;
+  if (overrunAllowanceTokens === undefined && takeBackGraceMs === undefined) {
+    // An empty policy stops nothing, yet stating it would still take a
+    // limits revision at startup.
+    throw new Error(
+      `${field} must set overrunAllowanceTokens or takeBackGraceMs`,
+    );
+  }
+  if (overrunAllowanceTokens !== undefined) {
+    assertInteger(
+      overrunAllowanceTokens,
+      `${field}.overrunAllowanceTokens`,
+      { min: 0 },
+    );
+    if (missingBudgetField !== undefined) {
+      throw new Error(
+        `${field}.overrunAllowanceTokens requires ${missingBudgetField}`,
+      );
+    }
+  }
+  if (takeBackGraceMs !== undefined) {
+    assertInteger(takeBackGraceMs, `${field}.takeBackGraceMs`, { min: 0 });
+    if (takeBackGraceMs > MAX_TAKE_BACK_GRACE_MS) {
+      throw new Error(
+        `${field}.takeBackGraceMs must be <= ${MAX_TAKE_BACK_GRACE_MS}`,
+      );
+    }
+  }
+  return Object.freeze({
+    ...(overrunAllowanceTokens === undefined ? {} : { overrunAllowanceTokens }),
+    ...(takeBackGraceMs === undefined ? {} : { takeBackGraceMs }),
+  });
+}
+
+/**
+ * The pool's stop policy, validated. `prefix` names the pool in errors:
+ * `pools[0]` during startup validation, the pool name afterward.
+ */
+function poolStopPolicy(
+  config: PoolConfig,
+  prefix: string,
+): Readonly<StopPolicyConfig> | undefined {
+  if (config.stop === undefined) return undefined;
+  const policy = normalizeStopPolicy(
+    config.stop,
+    `${prefix}.stop`,
+    config.budget === undefined ? `${prefix}.budget` : undefined,
+  );
+  if ((config.admissionMode ?? "enforce") !== "enforce") {
+    // Observe mode exists to measure policy without acting on requests.
+    throw new Error(
+      `${prefix}.stop requires ${prefix}.admissionMode to be "enforce"`,
+    );
+  }
+  return policy;
 }
 
 function validatePoolConfigs(configs: PoolConfig[]): void {
@@ -546,6 +695,8 @@ function validatePoolConfigs(configs: PoolConfig[]): void {
         config.budget !== undefined,
       );
     }
+
+    poolStopPolicy(config, base);
   });
 }
 
@@ -647,6 +798,22 @@ function createPool(
           `${config.name}.admissionClasses`,
           config.budget !== undefined,
         );
+  const stopPolicy = poolStopPolicy(config, config.name);
+  // The library accepts a stop policy only as part of a limits snapshot, and
+  // a snapshot needs a revision above the bulkhead's own. A pool that starts
+  // open would otherwise admit its first requests with no policy, so it is
+  // built one revision below the configured one and its starting limits are
+  // applied at the configured revision with the policy. Revision 0 has
+  // nothing below it, so that pool starts at revision 1. A pool that starts
+  // closed admits nothing until its first limits update, which carries the
+  // policy, and keeps its configured revision: a Latchflo-managed pool must
+  // stay at revision 0 until its first grant.
+  const configuredRevision = config.initialRevision ?? 0;
+  const statesStopAtStart = stopPolicy !== undefined && config.maxConcurrent > 0;
+  const bulkheadInitialRevision =
+    statesStopAtStart && configuredRevision > 0
+      ? configuredRevision - 1
+      : config.initialRevision;
 
   const adaptive = adaptiveEnabled
     ? createAdaptiveTokenEstimator({
@@ -680,8 +847,8 @@ function createPool(
     ...(config.queueTimeoutMs !== undefined
       ? { timeoutMs: config.queueTimeoutMs }
       : {}),
-    ...(config.initialRevision !== undefined
-      ? { initialRevision: config.initialRevision }
+    ...(bulkheadInitialRevision !== undefined
+      ? { initialRevision: bulkheadInitialRevision }
       : {}),
     ...(config.budget !== undefined
       ? {
@@ -717,6 +884,20 @@ function createPool(
           },
         }),
   });
+  if (stopPolicy !== undefined && statesStopAtStart) {
+    const starting = bulkhead.limits();
+    const stated = bulkhead.applyLimits({
+      ...starting,
+      revision: starting.revision + 1,
+      stop: stopPolicy,
+    });
+    if (!stated.applied) {
+      // Nothing else can have touched a bulkhead created a few lines above.
+      throw new Error(
+        `pool ${config.name} could not state its stop policy at startup`,
+      );
+    }
+  }
   const provenanceByRevision = new Map<number, AdmissionProvenance>();
   const admissionProvenanceEvents: TyrAdmissionProvenanceEvent[] = [];
   let admissionProvenanceDropped = 0;
@@ -798,6 +979,8 @@ function createPool(
               ),
             ),
           }),
+      // Already a frozen copy made by the library.
+      ...(liveLimits.stop === undefined ? {} : { stop: liveLimits.stop }),
     }) as LLMAdmissionLimits;
     const grant = provenanceByRevision.get(event.limitRevision);
     const record: TyrAdmissionProvenanceEvent = Object.freeze({
@@ -1094,6 +1277,22 @@ function createPool(
             ),
           },
         },
+        // The library omits its stop counters until the first stop. Here every
+        // cause is listed from the start, so a reader need not handle absence.
+        ...(stopPolicy === undefined && snapshot.llm.stopped === undefined
+          ? {}
+          : {
+              stop: {
+                ...(stopPolicy === undefined ? {} : { policy: stopPolicy }),
+                stopped: snapshot.llm.stopped ?? 0,
+                stoppedByCause: Object.freeze({
+                  overrun: snapshot.llm.stoppedByCause?.overrun ?? 0,
+                  limits: snapshot.llm.stoppedByCause?.limits ?? 0,
+                  drain_deadline:
+                    snapshot.llm.stoppedByCause?.drain_deadline ?? 0,
+                }),
+              },
+            }),
       },
     };
   }
@@ -1102,24 +1301,47 @@ function createPool(
     bulkhead.close();
   }
 
-  async function drain(timeoutMs?: number): Promise<LLMDrainResult> {
+  async function drain(
+    timeoutMs?: number,
+    options: PoolDrainOptions = {},
+  ): Promise<LLMDrainResult> {
+    const stopOnTimeout = options.stopOnTimeout === true;
     if (timeoutMs === undefined) {
+      if (stopOnTimeout) {
+        throw new Error(`${config.name} stopOnTimeout requires timeoutMs`);
+      }
       await bulkhead.drain();
       return { drained: true, inFlight: 0, pending: 0 };
     }
-    return bulkhead.drain({ timeoutMs });
+    return bulkhead.drain(
+      stopOnTimeout ? { timeoutMs, stopOnTimeout: true } : { timeoutMs },
+    );
   }
 
   const controller: PoolController = {
     limits: () => bulkhead.limits(),
     provenance: (revision) => provenanceByRevision.get(revision),
     applyLimits: (next, provenance) => {
+      // Read each supplied property once, and never `stop`: the pool's own
+      // policy is the only one. The library does not carry a policy over from
+      // the previous revision, so it is stated again on every snapshot.
+      const revision = next.revision;
+      const tokenBudget = next.tokenBudget;
+      const admissionClasses = next.admissionClasses;
+      const snapshot: LLMAdmissionLimits = {
+        revision,
+        maxConcurrent: next.maxConcurrent,
+        maxQueue: next.maxQueue,
+        ...(tokenBudget === undefined ? {} : { tokenBudget }),
+        ...(admissionClasses === undefined ? {} : { admissionClasses }),
+        ...(stopPolicy === undefined ? {} : { stop: stopPolicy }),
+      };
       const normalized = validateAdmissionProvenance(
         config.name,
-        next.revision,
+        revision,
         provenance,
       );
-      const result = bulkhead.applyLimits(next);
+      const result = bulkhead.applyLimits(snapshot);
       if (result.applied && normalized !== undefined) {
         retainProvenance(normalized);
       }
@@ -1130,6 +1352,7 @@ function createPool(
   return {
     name: config.name,
     mode,
+    ...(stopPolicy === undefined ? {} : { stopPolicy }),
     controller,
     estimate: (request) => bulkhead.estimate(request),
     resolveAdmissionClass: (identity) =>
@@ -1295,6 +1518,8 @@ function validateLimitSnapshot(
     throw new Error(`${poolName}.limits.admissionClasses must be omitted`);
   }
 
+  // `stop` is not read. A control plane does not choose the stop policy: the
+  // pool controller states the pool's own configured policy on every snapshot.
   return Object.freeze({
     revision,
     maxConcurrent,
@@ -1425,16 +1650,38 @@ export function createPools(
     for (const { pool } of pools) pool.close();
   }
 
-  async function drain(timeoutMs?: number): Promise<PoolsDrainResult> {
+  async function drain(
+    timeoutMs?: number,
+    options: PoolDrainOptions = {},
+  ): Promise<PoolsDrainResult> {
+    if (options.stopOnTimeout === true && timeoutMs === undefined) {
+      // Checked before admission closes, so a bad call changes nothing.
+      throw new Error("stopOnTimeout requires timeoutMs");
+    }
     close();
     const results = await Promise.all(
-      pools.map(async ({ pool }) => [pool.name, await pool.drain(timeoutMs)] as const),
+      pools.map(
+        async ({ pool }) =>
+          [pool.name, await pool.drain(timeoutMs, options)] as const,
+      ),
     );
     const byPool = Object.fromEntries(results);
+    // The library reports `stopped` only for a drain that was asked to stop.
+    const reportsStopped = results.some(
+      ([, result]) => result.stopped !== undefined,
+    );
     return {
       drained: results.every(([, result]) => result.drained),
       inFlight: results.reduce((total, [, result]) => total + result.inFlight, 0),
       pending: results.reduce((total, [, result]) => total + result.pending, 0),
+      ...(reportsStopped
+        ? {
+            stopped: results.reduce(
+              (total, [, result]) => total + (result.stopped ?? 0),
+              0,
+            ),
+          }
+        : {}),
       pools: byPool,
     };
   }

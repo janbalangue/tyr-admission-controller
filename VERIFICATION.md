@@ -1,11 +1,11 @@
-# Tyr 0.34.1 verification
+# Tyr 0.35.0 verification
 
 Date: 2026-11-23
 
 ## Version alignment
 
-- Tyr package version: `0.34.1`
-- Runtime version constant: `0.34.1`
+- Tyr package version: `0.35.0`
+- Runtime version constant: `0.35.0`
 - Runtime dependency: `async-bulkhead-llm@3.18.0`
 - Transitive bulkhead dependency: `async-bulkhead-ts@1.0.1`
 - Vendored runtime artifacts:
@@ -16,15 +16,193 @@ Date: 2026-11-23
 
 ## Required release order
 
-`async-bulkhead-llm@3.18.0` was published to npm on 2026-11-23, before this
-release was built. 0.34.1 moves Tyr from 3.17.0 to 3.18.0 and changes nothing
-in Tyr's own source except the version constant. Tyr's committed lockfile
+`async-bulkhead-llm@3.18.0` was published to npm on 2026-11-23, and Tyr has
+vendored it since 0.34.1. 0.35.0 keeps that tarball and is the first release
+to use what 3.18.0 added. Tyr's committed lockfile
 intentionally resolves the
 exact bundled `vendor/async-bulkhead-llm-3.18.0.tgz`, so the Tyr build is
 reproducible without the registry; the vendor artifact is not a substitute for
 publishing the declared public package version.
 `npm run verify:vendor-provenance` confirms the bundled tarball is
 byte-identical to the published one.
+
+## Stopping admitted requests (0.35.0)
+
+`npm run verify:stop` runs against the built `dist/` and a stand-in provider.
+It passes only if:
+
+- on a pool without a stop policy, a limits update that names
+  `stop: { takeBackGraceMs: 0 }` and leaves a running request above the new
+  limit stops nothing, `/stats` has no `limits.stop`, `llm.stopped` or
+  `tyr.stop`, and `/metrics` has no stop series;
+- a pool configured at revision 100 with `overrunAllowanceTokens: 50` reports
+  revision 100 with the policy applied. A streamed reply that reports 5,000
+  output tokens in mid-stream, against a 100-token output reservation, is cut
+  before its final event, the provider call is dropped, the audit event has
+  `settlement: "stopped"`, `stopCause: "overrun"` and usage of 1 input and
+  5,000 output tokens, the pool's held tokens return to 0, and `/stats` and
+  `/metrics` each count one overrun stop;
+- on the same kind of pool, a Chat Completions stream whose closing usage
+  chunk reports 9,000 output tokens is delivered in full, through
+  `data: [DONE]`, is audited as `completed` with that usage, and stops
+  nothing;
+- a pool with `takeBackGraceMs: 40` and no configured revision starts at
+  revision 1. With two requests running, an update to `maxConcurrent: 1`
+  stops the request admitted second, no sooner than the grace period, with
+  `503 admission_stopped`, cause `limits`, the two stop headers and no retry
+  hint. Its provider call is dropped, the other request completes with `200`,
+  and the `stop` field the update carried is not applied;
+- a streamed request whose provider has answered with headers and no event
+  is stopped by a take-back with `503 admission_stopped`, not a closed
+  connection;
+- at pool level, a stopped request whose callback ignores the abort leaves
+  the pool with no slot in use and its tokens still charged: a request of the
+  same size is refused with `budget_limit`, a smaller one is admitted, and the
+  tokens return when the callback settles;
+- the built server, started with `TYR_CONFIG_FILE`, a pool `stop` block and
+  `shutdown.stopOnDrainTimeout: true`, reports the file's policy at the
+  configured revision 7. `SIGTERM` with one request in flight answers `503`
+  with cause `drain_deadline` and `connection: close`, no sooner than the
+  150 ms drain deadline, drops the provider call, logs
+  `shutdown drain deadline reached inFlight=1 pending=0 stopped=1`, and exits
+  with code 0.
+
+The Vitest suite adds 65 tests: five new files and one test in
+`test/progressive-reconciliation.test.ts`. Beyond the cases above they cover:
+
+- every refused policy: not an object, empty, an unknown key, a negative or
+  fractional value, a grace period above 2,147,483,647, an overrun allowance
+  without a token budget, and a policy on an observe pool, in both the
+  programmatic and the YAML field names;
+- the starting revision: the configured one when it is above 0, 1 when it is
+  0 or omitted, and unchanged for a pool that starts closed, which gets the
+  policy with its first update and can then abort the first request it
+  admits;
+- class limits and the high-priority reserve surviving the startup update;
+- the policy restated on every update, a `stop` field on an update ignored on
+  both `control.applyLimits` and `Pool.controller.applyLimits`, and the
+  applied policy recorded on admission provenance events;
+- a usage report that leaves the pool above its budget stopping the request
+  admitted last, although the reporting request stays inside its own
+  allowance;
+- a stream whose first chunk reports the overrun: the request gets `503`
+  with cause `overrun`, because nothing of its reply had been written;
+- closing usage of 9,000 output tokens on all three provider routes: each
+  reply is delivered in full and audited as `completed`, and the pool's
+  consumed tokens include all of it;
+- closing usage still reported as a mid-stream report on a pool without an
+  overrun allowance, as in 0.34.1, and not on a pool with one;
+- which usage each stream extractor calls final, including a server that
+  reports cumulative usage on every Chat Completions chunk;
+- a queued request that takes a stopped request's slot: admitted when its
+  tokens fit, and refused with `429 budget_limit` when the stopped request's
+  tokens are still in the way;
+- a take-back that stops nothing when the work fits again within the grace
+  period, and one that stops normal-priority work before high-priority work;
+- a stopping drain over two pools, its per-pool and total `stopped` counts,
+  and a drain without the option reporting no `stopped` at all;
+- a shutdown with four requests on two pools, two of them on borrowed slots
+  with a deadline: all four get `503`;
+- a shutdown that stops an admitted request of an observe pool, and one with
+  the option off, which closes the connection and audits
+  `client_disconnect` as 0.34.1 did;
+- a Responses stream stopped before its final event: no response record is
+  written and its follow-up gets `422 unknown_previous_response`;
+- a managed pool behind the real Latchflo agent with a stubbed control plane:
+  the pool stays at revision 0 until the grant, the grant's revision 11
+  carries the policy, the agent's acknowledgement is `applied`, and the
+  request still running when the grant expires is stopped with cause
+  `limits` under revision 12, attributed to the grant that admitted it;
+- a streamed request that fails before its first chunk, on a pool with no
+  stop settings: `504 idle_timeout` when the provider stalls,
+  `502 upstream_error` with `afterHeaders: false` when the provider drops the
+  connection, and `504 borrowed_admission_deadline` when a borrowed slot
+  expires. After the first chunk the same failures still cut the reply;
+- a streamed reply's status, content type and admission headers arriving with
+  its first chunk, a provider reply with no body, and a provider error status
+  on a streamed request;
+- the `stop` blocks of both shipped example files, uncommented, and the
+  schema's `stop`, pool-rule and `shutdown` definitions.
+
+Each guarantee was also checked by breaking it on purpose and confirming a
+test failed. Of 28 such changes, 27 were caught:
+
+- in the stop handling: the stop branch removed, the upstream call not
+  dropped, the drain never asked to stop, the `connection: close` header
+  removed, the audit event without its cause, the upstream duration not
+  labeled `stopped`, and a reply that has started answered instead of cut;
+- in the policy: left off updates, a caller's policy forwarded, not stated at
+  startup, stated at startup by a closed pool, the pool not built one
+  revision lower, allowed on an observe pool, left off provenance events,
+  hidden from the request handler, and the pool ignoring `stopOnTimeout`;
+- in the stream path: the status line written when the provider answers, no
+  status line for a reply without a body, closing usage reported on a pool
+  with an allowance, closing usage held back on every pool, a chunk written
+  after its own usage stopped the request, each extractor never calling
+  usage final, and the Chat Completions extractor always calling it final;
+- the safety margin left uncapped, and the schema's budget rule removed.
+
+The one change no test catches is removing the turn of the event loop that
+shutdown takes between stopping at the drain deadline and closing
+connections. Without it every stopped request still got its `503` in these
+tests, because each handler answers one or two microtasks before shutdown
+continues. The turn is kept so that the answers do not depend on that order.
+
+An independent review of the first version of this change reproduced five
+defects. Three were fixed in the code, and eight of the tests above fail when
+those fixes are reverted:
+
+- A streamed request stopped before its first chunk had its connection
+  closed with no status, where the documentation promised `503`. Tyr treated
+  a reply as started once the provider answered. The same was true, since
+  earlier releases, of a stream that hit its idle timeout, lost its provider
+  or outlived a borrowed slot in that window. On the 0.34.1 build all three
+  end in a closed connection; on this build they get `504`, `502` and `504`.
+- A request was stopped for an overrun that its provider reported only as
+  the reply ended. The stop saved nothing and cost the client the end of a
+  finished reply.
+- The schema accepted an overrun allowance without a token budget, and a
+  `stop` block on an observe pool, both of which the runtime refuses. The
+  schema and the runtime loader now agree on 11 stop configurations and on
+  both shipped examples. That check was made once with `ajv` 6.15, which
+  reads the schema as draft-07 once `$schema` is removed; it is not part of
+  the suite.
+
+The other two are how the library's stops behave, and the documentation was
+corrected to say so:
+
+- The first version said a stopped request's tokens stay charged until the
+  provider call settles, as protection against a provider that keeps
+  working. In the gateway that call ends when Tyr drops it, and the tokens
+  were back about 1 ms after the stop was answered.
+- A stop returns the slot before the tokens. On a pool with a queue, the
+  request at the head of the queue takes the slot and is checked against a
+  budget the stopped request still occupies. In one run four of five queued
+  requests got `429 budget_limit` after two overrun stops; all five got `200`
+  when the same streams ended normally.
+
+With no stop settings, this build was compared with a build of the 0.34.1
+tag, using the 19 requests and the masking described under
+[Library update (0.34.1)](#library-update-0341). None of the 19 is a stream
+that fails before its first chunk:
+
+- One of the 19 is a streamed Responses request with
+  `max_output_tokens: 200`, below the 256-token safety margin. For that
+  request the margin fix changes three counters of its pool:
+  `totalOverrun` from 43 to 0, `totalRefunded` from 1,695 to 1,652, and
+  `earlyReleasedTokens` from 43 to 56. Those counters, the class copies of
+  the first two, and their three `/metrics` lines were the only differences
+  in three pairs of runs. Counting `/stats` before and after the drain, that
+  is 13 of 2,278 values. Both builds exposed the same 629 metric lines.
+- With that request reserving 300 output tokens instead, those counters
+  matched too, in five pairs of runs.
+- The only other difference seen was the whole-second `retry-after` header,
+  present in one run and absent in the other, in one pair of each set. That
+  hint comes from wall-clock intervals and varies between runs of one build.
+
+Not verified: a live provider API, and so whether a provider keeps working
+after Tyr drops the call, and which of its events carry usage; a real
+Latchflo control plane; the container image; and more than one replica.
 
 ## Library update (0.34.1)
 
@@ -288,12 +466,13 @@ still has no synchronous control-plane call.
 
 ## Carried-forward compatibility
 
-Tyr 0.34.1 retains the native Anthropic Messages, OpenAI Chat Completions, and
+Tyr 0.35.0 retains the native Anthropic Messages, OpenAI Chat Completions, and
 OpenAI Responses routes from 0.29.0. Responses requests stay stateless unless
 `responsesState` is configured. Existing identity, routing,
 managed-mode, provenance, timing, retry-hint, and progressive-reconciliation
 paths remain intact. Classes without `borrowedAdmissionSlot` keep the existing
-non-preemptive drain behavior.
+non-preemptive drain behavior, and no request is stopped unless a `stop`
+block or `shutdown.stopOnDrainTimeout` is configured.
 
 ## Release gate
 
@@ -306,7 +485,8 @@ npm run release:check
 
 The release gate verifies vendored tarball integrity, lint, TypeScript, the full
 Vitest suite, all executable integration verifiers (including borrowed
-restoration and response state), smoke imports, and `npm pack --dry-run`.
+restoration, response state and stopping), smoke imports, and
+`npm pack --dry-run`.
 
 For independent configuration checks:
 
@@ -323,18 +503,20 @@ git diff --check
 The full release gate passed on the development Mac on 2026-11-23, on Node.js
 24.18.0, in about 45 seconds:
 
-- 17 Vitest files passed, containing 274 tests;
+- 22 Vitest files passed, containing 339 tests;
 - every executable verifier passed, including the seven borrowed-restoration
-  assertions and `verify:responses-state`;
+  assertions, `verify:responses-state` and the seven `verify:stop` assertions;
 - both shipped YAML examples passed runtime CLI validation;
 - telemetry smoke and `git diff --check` passed;
-- `npm pack --dry-run` included 53 files, approximately 162.9 kB packed and
-  680.0 kB unpacked.
+- `npm pack --dry-run` included 53 files, approximately 177.1 kB packed and
+  731.8 kB unpacked.
 
 `npm run verify:vendor-provenance` also passed: the three vendored artifacts
-match their published releases. The Vitest suite, every offline verifier, the
-quick evaluation and the telemetry smoke also passed locally on Node.js
-20.20.0 and 22.23.1, with 274 tests on each. CI was not run for this record.
+match their published releases. The full release gate and the telemetry smoke
+also passed locally on Node.js 20.20.0 and 22.23.1, with 339 tests on each.
+The five new test files and the reconciliation tests were run 25 more times,
+the whole suite 4 more times and `verify:stop` 5 more times, without a
+failure. CI was not run for this record.
 
 The final ZIP is checked from a fresh extraction before delivery. It excludes
 platform-specific `node_modules`; consumers install the locked development

@@ -12,7 +12,7 @@ Tyr runs on its own. Latchflo, a separately licensed control plane, can
 coordinate one capacity envelope across many Tyr replicas; see
 [Latchflo managed mode](#latchflo-managed-mode).
 
-> **Status:** v0.34.1, pre-1.0, licensed under Apache-2.0 (see
+> **Status:** v0.35.0, pre-1.0, licensed under Apache-2.0 (see
 > [`LICENSE.txt`](LICENSE.txt)). Built on
 > [`async-bulkhead-llm@3.18.0`](https://www.npmjs.com/package/async-bulkhead-llm).
 
@@ -111,7 +111,8 @@ For each provider request, Tyr:
    bypass releases also feed adaptive estimation. With response memory
    configured, the size of a Responses reply is recorded before the reply ends.
 9. Releases remaining capacity when the request completes, fails, or the client
-   disconnects.
+   disconnects. With a [stop policy](#stopping-admitted-requests), Tyr may
+   also stop the request itself.
 
 Tyr does not translate between Anthropic and OpenAI request formats.
 
@@ -127,8 +128,9 @@ usage can correct the active hold while the response is running.
 Usage reported after admission can exceed the original estimate. In that case,
 `async-bulkhead-llm` expands the active hold, so live `inFlightTokens` may
 temporarily exceed the configured ceiling. Tyr blocks new admissions until
-capacity is released; it does not abort an already-running request. This is
-deliberate overrun accounting, not a strict post-admission kill switch.
+capacity is released. By default it does not abort an already-running request:
+this is deliberate overrun accounting, not a post-admission kill switch. A
+pool can opt in to [stopping such a request](#stopping-admitted-requests).
 
 Admission estimation uses the library request surfaces instead of folding the
 entire provider request into a synthetic user message:
@@ -203,7 +205,8 @@ Protected floors are strict within the active local limit snapshot. An idle
 floor is not implicitly lent to another class; Latchflo can implement
 demand-aware lending by issuing a newer atomic class-limit snapshot. Increasing
 or shrinking a floor or ceiling stops unsafe new borrowing, but existing work
-otherwise restores protection by attrition.
+otherwise restores protection by attrition, unless the pool has a
+[take-back grace period](#stopping-admitted-requests).
 
 `borrowedAdmissionSlot` places a post-admission wall-clock lease on local
 concurrency borrowed by that class. It does not apply when the admission fits
@@ -241,7 +244,8 @@ physical pool revision while keeping identity-to-class rules local.
 `observe` runs the same reservation and capacity decision but proxies requests
 that would have failed for budget, concurrency, queue, or admission timeout.
 Those bypasses receive a synthetic `shadow-...` admission ID and are counted in
-`/stats`. Shutdown and client-abort behavior are never shadowed.
+`/stats`. Shutdown and client-abort behavior are never shadowed. A pool in
+`observe` mode cannot have a `stop` block.
 
 Observe mode models the system that would exist under enforcement: requests
 that would be rejected do not consume simulated pool capacity. It is therefore
@@ -302,6 +306,11 @@ reservation to preview:
 | `x-tyr-routed-by` | Ingress Tyr instance that selected a remote replica; present only after forwarding |
 | `x-tyr-routed-to` | Tyr instance that performed the authoritative admission and provider invocation |
 
+A request Tyr stopped after admitting it, whose reply had not started, has
+`x-admission-reason: stopped` and `x-admission-stop-cause` set to `overrun`,
+`limits` or `drain_deadline`. It gets no retry hint. See
+[Stopping admitted requests](#stopping-admitted-requests).
+
 Actual admission rejections also include `x-admission-reason`, and — when Tyr
 has enough evidence — a retry hint:
 
@@ -346,6 +355,7 @@ admission, and a retry hint is an estimate rather than a reservation.
 | `502` | `upstream_error` or `routing_peer_unavailable` | The provider or selected Tyr peer failed before a valid response was returned. `upstream_error` carries `cause.code` (for example `ECONNREFUSED` or `UND_ERR_SOCKET`) when the transport reported one. A routed request is not automatically replayed. |
 | `503` | `identity_unavailable` | Tyr cannot currently verify identity because the verifier or JWKS endpoint is unavailable; retry with backoff. |
 | `503` | `admission_rejected` with reason `shutdown` | This Tyr instance is draining and no longer accepts admissions; retry another instance or retry with backoff. |
+| `503` | `admission_stopped` | With a stop policy configured, Tyr stopped a request it had admitted, before any part of its reply was written. `error.cause` is `overrun`, `limits` or `drain_deadline`. Tyr dropped the upstream call, but the provider may already have done part or all of the work; retry only when the operation is safe to repeat, and on another instance when the cause is `drain_deadline`. |
 | `504` | `borrowed_admission_deadline` | Tyr returned a borrowed local slot and requested upstream cancellation. The body reports local release as enforced and upstream reclamation as unverified; retry only when the operation is safe to repeat. |
 | `504` | `response_timeout`, `idle_timeout`, `routing_peer_timeout`, or `admission_rejected` with reason `timeout` | A provider, selected Tyr peer, stream-idle, or queued-admission deadline expired; retry only according to the operation's idempotency policy. |
 
@@ -353,6 +363,12 @@ Admission rejection bodies include the pool name and the bounded capacity detail
 reported by `async-bulkhead-llm`. Identity errors use `error.type` and do not
 include admission-capacity details. Only `401` identity responses include a
 `WWW-Authenticate` challenge; `503 identity_unavailable` deliberately does not.
+
+A streamed reply's status line is written with its first chunk. A streamed
+request that fails or is stopped before that gets the status in the table
+above, although the provider may already have answered with headers. Once a
+chunk has been written the status cannot change, and the connection is closed
+instead.
 
 ## Example requests
 
@@ -396,7 +412,7 @@ curl -i http://127.0.0.1:8787/v1/responses \
   }'
 ```
 
-Tyr 0.34.1 supports synchronous and streaming Responses requests. To keep
+Tyr 0.35.0 supports synchronous and streaming Responses requests. To keep
 pre-admission token reservations bounded, it rejects server-side
 `conversation`, stored `prompt` templates, `item_reference`,
 `background: true`, and provider-managed retrieval/computer tools.
@@ -457,6 +473,172 @@ remain conservative automatically. The repository lockfile resolves the bundled
 `vendor/async-bulkhead-llm-3.18.0.tgz` and
 `vendor/async-bulkhead-ts-1.0.1.tgz`, so the release can be built before those
 artifacts are fetched from a public registry.
+
+## Stopping admitted requests
+
+By default Tyr never touches a request once it has admitted it. A request that
+uses more tokens than it reserved only widens its hold, a lowered limit waits
+for running requests to finish, and a bounded shutdown closes connections at
+its deadline. Since 0.35.0 a deployment can opt in to stopping admitted
+requests in those three situations. Stops are made by
+`async-bulkhead-llm@3.18.0`.
+
+```yaml
+shutdown:
+  drainTimeoutMs: 30000
+  stopOnDrainTimeout: true          # stop what outlives the drain deadline
+
+pools:
+  - name: interactive-claude
+    inFlightTokenBudget: 400000
+    stop:
+      overrunAllowanceTokens: 2000  # how far a hold may pass its reservation
+      takeBackGraceMs: 5000         # then work above lowered limits is stopped
+```
+
+A stop means the same thing whatever caused it:
+
+- The request's concurrency slot returns at once.
+- Tyr drops the upstream call. The request's tokens are returned when that
+  call has ended on Tyr's side, normally within milliseconds. Tyr does not
+  wait for the provider, and it cannot tell whether the provider stopped
+  work.
+- A request that has been sent no part of its reply gets `503` with
+  `error.type: "admission_stopped"`, `x-admission-reason: stopped` and
+  `x-admission-stop-cause`. That includes a streamed request whose first
+  chunk has not been written. Once part of a reply has been written, the
+  reply is cut: its connection closes with no further event. Neither gets a
+  retry hint.
+- The request is counted and audited as `stopped`, with its cause. It is not
+  an admission rejection and not an upstream failure.
+- On a pool with a queue (`maxQueue` above 0), the returned slot goes to the
+  request at the head of the queue at once, while the stopped request's
+  tokens are still charged. A waiter whose reservation does not fit beside
+  them is rejected with `429 budget_limit` instead of waiting.
+
+| Cause | Turned on by | A request is stopped when |
+|---|---|---|
+| `overrun` | `pools[].stop.overrunAllowanceTokens` | A usage report raises its hold more than the allowance above its reservation. Also, when a report leaves the pool above `inFlightTokenBudget`, or a class above `maxInFlightTokens`, requests are stopped until the rest fit. |
+| `limits` | `pools[].stop.takeBackGraceMs` | A limits update left running requests above the new limits, and the grace period has ended. |
+| `drain_deadline` | `shutdown.stopOnDrainTimeout` | It is still running when `shutdown.drainTimeoutMs` elapses. |
+
+When Tyr has to choose, it stops requests on borrowed class capacity first,
+then normal priority before high priority, then the request admitted last.
+Queued requests and observe-mode bypasses hold no capacity and are never
+stopped.
+
+### Overrun
+
+The allowance is measured on the request's hold: the tokens it has charged to
+the pool. It is not measured on the request's usage.
+
+- With progressive reconciliation on, which is the default for a budgeted
+  pool, a hold shrinks as the reply streams and grows again only by the output
+  beyond the request's output reservation. The request is stopped once that
+  excess is more than its reservation plus the allowance, less the safety
+  margin it still holds. A request that reserved 1,000 input and 4,096 output
+  tokens, with the default 256-token margin and an allowance of 2,000, is
+  stopped after about 6,800 tokens of output beyond the 4,096. An input
+  estimate that was too low does not grow the hold.
+- With `progressiveReconciliation.enabled: false`, a hold is the reported
+  input plus the larger of the output reservation and the reported output.
+  The request is stopped once its input above the estimate plus its output
+  above the reservation exceeds the allowance. An input estimate that was too
+  low counts here, so leave room for estimation error.
+- Tyr sees usage before a request completes only while its reply streams. A
+  request that is not streamed reports usage at completion, so it is never
+  stopped for its own usage. It can still be stopped to make room when
+  another request's report leaves the pool above its budget.
+- The usage a provider sends as it ends a reply never stops that reply. By
+  then the work is done, and cutting the reply would save nothing. On a pool
+  with an allowance Tyr applies that usage when the request completes. It is
+  recognized as the Anthropic `message_delta` that carries a stop reason, a
+  Chat Completions usage chunk with no choices or with a finish reason, and a
+  Responses event that shows a finished response.
+- An overrun stop therefore needs usage that arrives before the reply ends.
+  In the stream formats Tyr reads, OpenAI's Chat Completions and Responses
+  report usage only as a reply ends, so their requests are not stopped for
+  their own output. Anthropic reports input tokens in its first event and
+  output tokens in its closing one. What an allowance acts on is a server
+  that reports cumulative usage while it streams, input that Anthropic
+  reports above the estimate when progressive reconciliation is off, and a
+  pool or class pushed above its token ceiling by either.
+- On a pool with an allowance, closing usage is not a mid-stream report: it
+  is absent from `tyr.progressiveReconciliation`, and an overrun that only
+  the closing usage shows is not added to `tyr_pool_tokens_overrun_total`.
+  The consumed-token counters include it.
+
+### Take-back
+
+- Nothing is stopped during the grace period, and a request that finishes
+  inside it is left alone. A grace period of `0` stops on the next timer tick.
+- "Above the new limits" covers the pool's `maxConcurrent`, its token budget,
+  a class's own ceilings, and a class floor that was restored while other
+  classes were using that capacity.
+- A newer limits update replaces a take-back that is still waiting, and its
+  own grace period starts when it is applied. Updates that arrive faster than
+  the grace period keep postponing the stop, so choose a grace period shorter
+  than the interval between updates.
+- In [Latchflo managed mode](#latchflo-managed-mode) this bounds a shrink that
+  otherwise waits for requests to finish. It also covers the zero-capacity
+  revision Tyr applies when a grant expires: requests still running when the
+  grace period ends are stopped.
+
+### Shutdown
+
+`shutdown.stopOnDrainTimeout` requires `shutdown.drainTimeoutMs`. It applies
+to every pool, including observe pools and pools without a `stop` block. At
+the deadline Tyr stops each request still running, answers or cuts it, and
+then closes the remaining connections as before. `shutdown()` reports
+`stopped`, the number of admissions the deadline stopped, and the process logs
+it as `stopped=<n>`. The result is taken at the deadline, before the dropped
+calls have ended, so `drained` is `false` and `inFlight` still counts them.
+
+### Where the policy lives
+
+The library accepts a stop policy only as part of a limits snapshot and does
+not carry it from one revision to the next. Tyr therefore states the pool's
+configured policy on every limits update it applies, whether the update comes
+from the [embedded control surface](#embedded-control-surface) or from
+Latchflo. A `stop` field on an update is ignored: a control plane does not
+choose the policy.
+
+- A pool that starts open applies the policy at startup, at revision
+  `max(limitsRevision, 1)`. Revision 0 cannot carry a policy, so a pool whose
+  `limitsRevision` is 0 or omitted starts at revision 1, and its first runtime
+  update must be revision 2 or higher.
+- A pool that starts closed (`maxConcurrent: 0`), as every Latchflo-managed
+  pool does, keeps its configured revision and gets the policy with its first
+  update.
+- A `stop` block cannot be combined with `admissionMode: observe`.
+- Stop settings are read from a configuration file or passed to
+  `createGateway`. Legacy environment mode has no variables for them.
+
+### Observing stops
+
+- `GET /stats`: `limits.stop` is the applied policy. `tyr.stop` holds the
+  configured `policy`, `stopped`, and `stoppedByCause` with every cause
+  listed. It is present on a pool with a `stop` block, and on any pool once
+  one of its requests has been stopped. `llm.stopped` and
+  `llm.stoppedByCause` are the library's own counters and are absent until
+  the first stop.
+- `GET /metrics`: `tyr_pool_stopped_total{pool,cause}`,
+  `tyr_pool_admission_class_stopped_total{pool,admission_class}`,
+  `tyr_pool_stop_overrun_allowance_tokens{pool}` and
+  `tyr_pool_stop_take_back_grace_seconds{pool}`. They exist only for a pool
+  that reports `tyr.stop`. `tyr_requests_total` and
+  `tyr_upstream_duration_seconds` gain the `outcome` value `stopped`.
+- Between a stop and the end of the dropped call, the request holds tokens
+  but no slot. For that moment it shows in `tyr_pool_work_in_flight` and in
+  `tyr.restoration.upstreamCapacity.activeAccountingHolds`, not in
+  `tyr_pool_in_flight`.
+- The admission audit event has `settlement: "stopped"` and a `stopCause`.
+
+A stop is a local decision. It returns Tyr's slot and tokens and closes Tyr's
+connection to the provider. It does not prove that a provider account, a
+model-side queue or an accelerator stopped work, and Tyr lends the returned
+capacity again without that proof. If the constrained resource is upstream,
+keep an unlent floor or use a provider-side partition.
 
 ## Response memory for Responses follow-ups
 
@@ -592,6 +774,7 @@ timeouts:
 
 shutdown:
   drainTimeoutMs: 30000
+  stopOnDrainTimeout: false
 
 priority:
   trustHeader: false
@@ -664,6 +847,7 @@ pools:
 | `timeouts.streamIdleMs` | No | Maximum gap between upstream stream chunks |
 | `timeouts.clientStallMs` | No | Maximum wait for a backpressured client to drain |
 | `shutdown.drainTimeoutMs` | No | Bounded graceful-drain deadline; omit for unbounded drain |
+| `shutdown.stopOnDrainTimeout` | No | Stop requests still running at the drain deadline; requires `drainTimeoutMs`; default `false` |
 | `priority.trustHeader` | No | Legacy trusted-proxy fallback; ignored on provider routes when identity is configured |
 | `identity.jwt.jwksUrl` | Identity only | HTTP(S) JWKS endpoint used to verify JWT signatures |
 | `identity.jwt.issuer` | Identity only | Exact required `iss` claim |
@@ -718,6 +902,8 @@ pools:
 | `pools[].admissionClasses.classes.<id>.borrowedAdmissionSlot.releaseMechanism` | No | Must be `deadline_abandonment`; releases only borrowed local concurrency |
 | `pools[].admissionClasses.classes.<id>.borrowedAdmissionSlot.deadlineMs` | With borrowed-slot policy | Post-admission local slot lease from `1` through `2147483647` ms; not an upstream reclamation guarantee |
 | `pools[].admissionClasses.rules` | No | Up to 256 ordered mappings from trusted subject, tenant, application, or role claims to fixed class IDs |
+| `pools[].stop.overrunAllowanceTokens` | No | Tokens a request's hold may grow above its reservation before the request is stopped; requires `inFlightTokenBudget` |
+| `pools[].stop.takeBackGraceMs` | No | Milliseconds after a limits update before requests above the new limits are stopped, from `0` through `2147483647` |
 
 Identity verification remains fail closed when no usable key is cached. A fresh
 cached key remains usable until `identity.jwt.cacheTtlMs` expires, allowing Tyr to
@@ -750,6 +936,11 @@ for final token settlement as well as local concurrency. A callback that remains
 unsettled after its borrowed slot was returned can therefore keep an unbounded
 shutdown pending; configure the timeout when process termination must be
 bounded. Expiry bounds Tyr's wait, not upstream provider execution.
+
+`shutdown.stopOnDrainTimeout` and a pool's `stop` block turn on
+[stopping admitted requests](#stopping-admitted-requests). A `stop` block must
+set at least one of its two fields and cannot be combined with
+`admissionMode: observe`.
 
 ## Authenticated identity and priority safety
 
@@ -817,7 +1008,7 @@ tyr validate --config ./deploy/tyr.yaml
 Build the included image:
 
 ```bash
-docker build -t tyr-admission-controller:0.34.1 .
+docker build -t tyr-admission-controller:0.35.0 .
 ```
 
 The source tree must include the committed `vendor/` directory. Run `npm run verify:vendor` before building or publishing a source archive.
@@ -831,7 +1022,7 @@ docker run --rm \
   -p 127.0.0.1:8787:8787 \
   -e TYR_CONFIG_FILE=/etc/tyr/config.yaml \
   -v "$PWD/tyr.yaml:/etc/tyr/config.yaml:ro" \
-  tyr-admission-controller:0.34.1
+  tyr-admission-controller:0.35.0
 ```
 
 A configuration that uses `responsesState` also needs a writable mount for the
@@ -918,7 +1109,10 @@ explicit `content-length`.
 in-flight bulkhead work. Requests reaching an existing keep-alive connection
 during shutdown receive `503` with `x-admission-reason: shutdown`. When
 `shutdown.drainTimeoutMs` is configured, Tyr closes remaining connections after
-the bounded v3.12 drain snapshot reports outstanding work.
+the bounded v3.12 drain snapshot reports outstanding work. With
+`shutdown.stopOnDrainTimeout` as well, Tyr first stops the requests still
+running at the deadline: one whose reply has not started gets `503
+admission_stopped`, and each is counted and audited as stopped.
 
 Without `shutdown.drainTimeoutMs`, drain also waits for final token settlement
 after a borrowed local slot has been returned. A callback that never settles
@@ -942,13 +1136,18 @@ Tyr never abandons manually, so a non-zero `manual` count only appears when an
 embedder returns a slot itself. Only `deadline` expiry aborts the callback
 signal, so `upstreamCapacity.cancellationRequested` counts that cause alone; a
 rising `deadline` share means the configured lease is too tight.
+`upstreamCapacity.activeAccountingHolds` also counts stopped requests whose
+upstream call has not settled. `tyr.stop` reports a pool's stop policy and its
+stopped requests by cause; see
+[Stopping admitted requests](#stopping-admitted-requests).
 
 `tyr.admissionProvenance` is a fixed-size 512-event ring for successful,
 capacity-holding admissions only; observe-mode bypasses are intentionally absent.
 Each event uses schema `tyr.admission-provenance.v1` and includes a pool-local
 monotonic `sequence`, `admittedAt`, Tyr-generated `admissionId`, `pool`,
 `priority`, optional `admissionClass`, `limitRevision`, `reservedTokens`, the
-exact `resources` borrowing attribution, the applied `limits` snapshot, and the
+exact `resources` borrowing attribution, the applied `limits` snapshot
+(with `limits.stop` when the pool has a stop policy), and the
 matching managed `grant` when one
 exists. The wrapper also reports `retained`, `dropped`, `captureFailures`, and
 `nextSequence`. Benchmark consumers should require `captureFailures == 0` and
@@ -963,7 +1162,7 @@ pool name, configured admission-class ID, provider shape, priority, status
 class, outcome, and enumerated reason. Model strings, request IDs, admission
 IDs, grant IDs, and tenant-supplied identity values never become metric labels.
 
-Tyr 0.34.1 carries forward two admission-path histograms.
+Tyr 0.35.0 carries forward two admission-path histograms.
 `tyr_admission_decision_seconds` measures synchronous local decision work and
 **excludes** the awaited local concurrency acquire.
 `tyr_admission_queue_wait_seconds` measures that acquire wait separately. Both
@@ -1037,7 +1236,7 @@ is logged but never returned to the caller.
 - Upstream response headers are not generally passed through; Tyr returns the
   upstream status and body with a normalized content type.
 - There is no Anthropic/OpenAI format translation.
-- Response memory is per process in v0.34.1. A `previous_response_id`
+- Response memory is per process in v0.35.0. A `previous_response_id`
   follow-up is admitted only on the replica that recorded the response it
   names, and capacity routing does not forward Responses requests that create
   or use a record. A response deleted at the provider keeps its record until
@@ -1047,9 +1246,23 @@ is logged but never returned to the caller.
   background execution, and provider-managed retrieval/computer tools are
   rejected until Tyr can reserve their capacity without undercounting unseen
   state.
-- There is no active-stream termination policy for post-admission usage
-  overruns. `async-bulkhead-llm@3.18.0` can stop work it has admitted, but Tyr
-  0.34.1 applies no stop policy and stops nothing.
+- Stopping an admitted request is opt-in and local. A stop returns Tyr's slot
+  and tokens and drops the upstream call. It does not prove the provider
+  stopped work.
+  - A reply that has started is cut without an error event, so the client
+    cannot tell a stop from a broken connection.
+  - An overrun is measured on the request's hold. With progressive
+    reconciliation on, a request is stopped only after its output has overrun
+    by about the size of its reservation.
+  - A request is stopped for an overrun only when the provider reports the
+    usage before the reply ends. OpenAI's Chat Completions and Responses
+    streams report usage as they end, so their requests are never stopped for
+    their own output.
+  - On a pool with a queue, a stop can turn a waiting request into a
+    `429 budget_limit`: the waiter takes the returned slot while the stopped
+    request's tokens are still charged.
+  - The stop policy is local configuration. Latchflo does not distribute it,
+    and Tyr does not tell Latchflo that it stops work.
 - Multi-controller Latchflo failover, tenant policy, and supported Helm packaging
   remain roadmap work.
 
@@ -1173,7 +1386,7 @@ controlPlane:
   metadata:
     region: us-west
     zone: us-west-2a
-    version: 0.34.1
+    version: 0.35.0
     endpoint: http://tyr-a:8787
     labels:
       environment: demo
@@ -1203,7 +1416,7 @@ bounded by `requestTimeoutMs`.
 ### Demand-aware Latchflo heartbeats
 
 Tyr automatically derives one snapshot per managed pool from its existing
-statistics. Tyr 0.34.1 carries forward bounded per-class demand in that additive
+statistics. Tyr 0.35.0 carries forward bounded per-class demand in that additive
 heartbeat while preserving the original pool-level fields:
 
 ```json
@@ -1258,7 +1471,7 @@ identity values never become heartbeat keys. `protected*` and `borrowed*` fields
 report current use of the active floor and shared remainder. They are telemetry,
 not a request for Tyr to resize its own limits.
 
-Tyr 0.34.1 advertises `admissionClassDemand: true`,
+Tyr 0.35.0 advertises `admissionClassDemand: true`,
 `grantOccupancyAck: true`, `admissionClassOccupancyAck: true`, and the additive
 `borrowedAdmissionSlotDeadlines: true` capability at registration. Older control
 planes that ignore unknown capability and nested evidence fields remain
@@ -1277,7 +1490,9 @@ lent early.
 When Latchflo 0.10.0 restores capacity from a borrower, it can issue a lower
 complete physical-pool grant as a drain target. Tyr installs that higher
 revision locally first, so no new request can extend occupancy beyond the new
-ceiling. Active work is not revoked; the pool shrinks by attrition.
+ceiling. Active work is not revoked; the pool shrinks by attrition. With
+`stop.takeBackGraceMs` on the pool, requests still above the new limits when
+the grace period ends are stopped, which bounds how long the shrink takes.
 
 Only after the `applied` acknowledgement succeeds does Tyr publish a separate
 demand heartbeat. If the exact published snapshot is still above the new
@@ -1291,7 +1506,7 @@ The acknowledgement's `occupancy` object is additive observability evidence;
 Latchflo 0.10.0 does not need to trust it to commit a transfer. The fresh
 post-ack heartbeat remains the authoritative proof used by that control plane.
 
-Tyr 0.34.1 applies the same ordering to restrictive class-only changes. When a
+Tyr 0.35.0 applies the same ordering to restrictive class-only changes. When a
 protected floor is restored, the newly protected capacity reduces the shared
 remainder. Tyr therefore keeps publishing bounded class evidence until the sum
 of `borrowedConcurrent` fits within the desired shared concurrency remainder and,
@@ -1303,13 +1518,16 @@ and hard ceilings so Latchflo can reject stale snapshots.
 `/readyz` remains `503` until every managed pool has a complete unexpired grant.
 A transient poll failure does not discard a still-valid lease. When a grant
 expires, Tyr applies the reserved next even revision with zero capacity and
-immediately becomes unready. Grant acknowledgements are best-effort and cannot
+immediately becomes unready. Requests already running continue, unless the
+pool has `stop.takeBackGraceMs`: that revision carries the pool's stop policy
+like any other, so they are stopped when the grace period ends. Grant
+acknowledgements are best-effort and cannot
 interrupt local expiration enforcement after limits have been applied.
 
 Omit `controlPlane.pools` to manage every pool declared in the Tyr file. Pool
 names are validated at startup, and a grant batch is preflighted before any
 local pool mutates. Queue timeout, model routing, estimator policy, admission
-mode, and provider upstreams remain construction-time settings.
+mode, stop policy, and provider upstreams remain construction-time settings.
 
 ### Embedded control surface
 
@@ -1345,7 +1563,11 @@ Revisions must be strictly greater than the current revision, and provenance
 revision must match the limit revision. Tyr retains a bounded revision ledger
 so in-flight requests remain attributable to the grant captured at admission.
 Reductions use shrink-by-attrition; setting `maxConcurrent: 0` disables new
-admissions immediately.
+admissions immediately. A pool with `stop.takeBackGraceMs` stops what is still
+above the new limits when the grace period ends. Tyr adds the pool's own stop
+policy to every update and ignores a `stop` field on the update. A pool that
+starts open with a stop policy starts at revision `max(limitsRevision, 1)`,
+so read `control.limits()` for the current revision instead of assuming it.
 
 ## Repository layout
 
@@ -1362,7 +1584,7 @@ src/
   index.ts          validated process entrypoint and managed-mode lifecycle
   latchflo.ts        built-in Latchflo agent, retry, readiness, demand heartbeat, and token persistence
   demand.ts          accepted-heartbeat demand deltas derived from live pool statistics
-  pools.ts          v3.18 policy runtime, progressive reconciliation, versioned limits, observe mode, and drain
+  pools.ts          v3.18 policy runtime, progressive reconciliation, versioned limits, stop policy, observe mode, and drain
   routing.ts        protected peer snapshots and request-specific replica selection
   responses-state.ts response memory for Responses follow-ups and its state file
   server.ts         HTTP proxy, routing, admission, telemetry, timeouts, and shutdown
@@ -1383,6 +1605,11 @@ test/
   responses-state.test.ts response-memory bounds, ownership, and state-file tests
   responses-state-gateway.test.ts follow-up admission, refusal, streaming, and restart tests
   responses-state-config.test.ts responsesState file-configuration and schema tests
+  stop.test.ts      stop policy, overrun, take-back, drain-deadline, and stop metric tests
+  stop-gateway.test.ts stopped-request replies, stopping shutdown, response memory, and managed-pool tests
+  stop-config.test.ts stop file-configuration and schema tests
+  stream-head.test.ts streamed-reply status before and after the first chunk
+  stream-usage-final.test.ts which stream usage each provider format marks as final
 eval/
   run.mjs           self-serve evaluation runner (npm run eval, eval:serve, verify:eval)
   tyr.eval.yaml     single-node evaluation configuration with admission classes
@@ -1440,8 +1667,9 @@ Startup configuration seeds pool routing, estimator policy, timeout behavior,
 and the initial admission-limit snapshot. Routing and estimator changes still
 require a restart. Concurrency, queue capacity, token budget, and high-priority
 reserve can be replaced at runtime through the versioned `control` interface;
-existing work drains under the new ceilings and is never cancelled merely
-because a limit shrank.
+existing work drains under the new ceilings. It is not stopped merely because
+a limit shrank, unless the pool has a
+[take-back grace period](#stopping-admitted-requests).
 
 ## Development commands
 
@@ -1457,6 +1685,7 @@ npm run verify:routing-topology
 npm run verify:openai-responses
 npm run verify:responses-state
 npm run verify:borrowed-restoration
+npm run verify:stop
 npm run verify:demand
 npm run verify:admission-provenance
 npm run verify:eval

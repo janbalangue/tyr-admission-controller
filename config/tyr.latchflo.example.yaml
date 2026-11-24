@@ -35,6 +35,14 @@ pools:
     limitsRevision: 0
     admissionMode: enforce
     defaultOutputReservation: 4096
+    # Optional. Without it a lower grant waits for running requests to finish.
+    # With it, requests that a lower grant leaves above the new limits are
+    # stopped after the grace period. That includes the zero-capacity revision
+    # Tyr applies when a grant expires. Local policy: Latchflo does not send
+    # it. Keep the grace period shorter than the gap between grant revisions,
+    # because a newer revision restarts it.
+    # stop:
+    #   takeBackGraceMs: 5000
     # Latchflo owns the physical pool grant. Configure the fixed class keys at
     # zero while the managed pool starts closed; the first class-aware grant
     # atomically supplies physical limits, protected floors, and hard ceilings.
@@ -81,7 +89,7 @@ controlPlane:
   metadata:
     region: us-west
     zone: us-west-2a
-    version: 0.34.1
+    version: 0.35.0
     endpoint: http://tyr-a:8787
     labels:
       environment: demo

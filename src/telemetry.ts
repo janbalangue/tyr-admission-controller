@@ -1,12 +1,17 @@
 import type {
   LLMAdmissionResources,
+  LLMAdmissionStopCause,
   LLMPriority,
   LLMRejectReason,
   TokenUsage,
 } from "async-bulkhead-llm";
 import type { ApiShape } from "./adapters.js";
 import type { TyrRequestIdentity } from "./identity.js";
-import type { AdmissionProvenance, TyrPoolStats } from "./pools.js";
+import {
+  STOP_CAUSES,
+  type AdmissionProvenance,
+  type TyrPoolStats,
+} from "./pools.js";
 import type { ResponsesStatePoolStats } from "./responses-state.js";
 import type { UpstreamFailure } from "./upstream-failure.js";
 import { TYR_VERSION } from "./version.js";
@@ -28,6 +33,7 @@ export type TyrRequestOutcome =
   | "upstream_5xx"
   | "admission_rejected"
   | "borrowed_admission_deadline"
+  | "stopped"
   | "response_timeout"
   | "idle_timeout"
   | "client_disconnect"
@@ -38,6 +44,7 @@ export type TyrAuditSettlement =
   | "completed"
   | "rejected"
   | "borrowed_admission_deadline"
+  | "stopped"
   | "response_timeout"
   | "idle_timeout"
   | "client_disconnect"
@@ -78,6 +85,11 @@ export type TyrAdmissionAuditEvent = {
       readonly outcome: "cancellation_requested";
     };
   };
+  /**
+   * Why Tyr stopped the request after admitting it. Present exactly when
+   * `settlement` is `stopped`.
+   */
+  readonly stopCause?: LLMAdmissionStopCause;
   readonly grant?: AdmissionProvenance;
   readonly usage?: TokenUsage;
   readonly identity?: TyrRequestIdentity;
@@ -1044,6 +1056,82 @@ export class TyrTelemetry {
           if (responsesState !== undefined) {
             addSample(lines, metric.name, metric.value(responsesState), { pool });
           }
+        }
+      }
+    }
+
+    // Stopping admitted work is opt-in too. A pool reports `tyr.stop` when it
+    // has a stop policy or has had a request stopped, and only then do these
+    // series exist.
+    const stopPools = poolNames.filter(
+      (pool) => stats[pool]?.tyr.stop !== undefined,
+    );
+    if (stopPools.length > 0) {
+      addMetricHeader(
+        lines,
+        "tyr_pool_stopped_total",
+        "counter",
+        "Admitted requests Tyr stopped, by cause. The local slot was returned; upstream reclamation is unverified.",
+      );
+      for (const pool of stopPools) {
+        const byCause = stats[pool]?.tyr.stop?.stoppedByCause;
+        for (const cause of STOP_CAUSES) {
+          addSample(lines, "tyr_pool_stopped_total", byCause?.[cause] ?? 0, {
+            pool,
+            cause,
+          });
+        }
+      }
+
+      addMetricHeader(
+        lines,
+        "tyr_pool_admission_class_stopped_total",
+        "counter",
+        "Admitted requests of a bounded admission class that Tyr stopped.",
+      );
+      for (const pool of stopPools) {
+        const classes = stats[pool]?.admissionClasses?.classes;
+        if (classes === undefined) continue;
+        for (const admissionClass of Object.keys(classes).sort()) {
+          addSample(
+            lines,
+            "tyr_pool_admission_class_stopped_total",
+            classes[admissionClass]?.stopped ?? 0,
+            { pool, admission_class: admissionClass },
+          );
+        }
+      }
+
+      addMetricHeader(
+        lines,
+        "tyr_pool_stop_overrun_allowance_tokens",
+        "gauge",
+        "Configured tokens a hold may grow above its reservation before the request is stopped; absent when overrun stops are off.",
+      );
+      for (const pool of stopPools) {
+        const allowance = stats[pool]?.tyr.stop?.policy?.overrunAllowanceTokens;
+        if (allowance !== undefined) {
+          addSample(lines, "tyr_pool_stop_overrun_allowance_tokens", allowance, {
+            pool,
+          });
+        }
+      }
+
+      addMetricHeader(
+        lines,
+        "tyr_pool_stop_take_back_grace_seconds",
+        "gauge",
+        "Configured grace period before work above lowered limits is stopped; absent when take-back stops are off.",
+      );
+      for (const pool of stopPools) {
+        const graceMs = stats[pool]?.tyr.stop?.policy?.takeBackGraceMs;
+        if (graceMs !== undefined) {
+          addSample(
+            lines,
+            "tyr_pool_stop_take_back_grace_seconds",
+            graceMs / 1_000,
+            { pool },
+          );
         }
       }
     }

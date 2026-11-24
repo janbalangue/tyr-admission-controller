@@ -12,7 +12,8 @@
  * `onResponse` callback receives each one with its event type, so a caller
  * that keeps response memory can record a finished response's id and size.
  */
-import type { UsageObservation } from "./sse.js";
+import { streamResponseFinished } from "./responses-state.js";
+import type { UsageListener, UsageObservation } from "./sse.js";
 
 function usageFrom(value: unknown): UsageObservation | undefined {
   if (value === null || typeof value !== "object") return undefined;
@@ -33,7 +34,7 @@ function usageFrom(value: unknown): UsageObservation | undefined {
 }
 
 export function createOpenAIResponsesSSEUsageExtractor(
-  onUsage: (usage: UsageObservation) => void,
+  onUsage: UsageListener,
   onResponse?: (response: Record<string, unknown>, eventType: unknown) => void,
 ) {
   let buffer = "";
@@ -59,7 +60,8 @@ export function createOpenAIResponsesSSEUsageExtractor(
       usageFrom(responseObject?.["usage"]) ?? usageFrom(event["usage"]);
     if (observed === undefined) return;
     currentUsage = observed;
-    onUsage(observed);
+    // Usage on an event that shows the response is finished is final.
+    onUsage(observed, streamResponseFinished(responseObject, event["type"]));
   }
 
   return {
