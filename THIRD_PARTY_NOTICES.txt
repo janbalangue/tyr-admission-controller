@@ -30,7 +30,7 @@ RUNTIME JAVASCRIPT COMPONENTS
 
 CONTAINER BASE IMAGE
 
-The standard Dockerfile uses the official node:20-alpine base image. That image
+The standard Dockerfile uses the official node:24-alpine base image. That image
 contains Node.js, npm, Alpine Linux packages, and other third-party components
 under their own licenses. The exact component set depends on the resolved image
 digest at build time. License files, package metadata, and notices supplied by

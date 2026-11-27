@@ -4,7 +4,7 @@ Thanks for helping improve Tyr.
 
 ## Development setup
 
-Use Node.js 20 or newer. CI runs Node 20, 22 and 24.
+Use Node.js 22 or newer. CI runs Node 22 and 24.
 
 ```bash
 npm ci
@@ -14,6 +14,10 @@ npm run release:check
 `release:check` runs the vendored-artifact check, lint, type-check, the unit
 tests, the behavior verification scripts, a smoke import and an `npm pack` dry
 run. Run it before opening a pull request.
+
+The documentation is the README plus the guides in `guides/`. `npm run docs`
+builds the documentation site into `docs/` and reports any broken link between
+them.
 
 The runtime dependencies `async-bulkhead-llm`, `async-bulkhead-ts` and `yaml`
 are vendored in `vendor/` as the exact tarballs npm published, and the lockfile

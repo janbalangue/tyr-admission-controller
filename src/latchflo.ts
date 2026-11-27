@@ -103,7 +103,7 @@ type RegistrationResponse = {
   readonly controllerEpoch: number;
 };
 
-type Logger = Pick<Console, "info" | "warn" | "error">;
+export type Logger = Pick<Console, "info" | "warn" | "error">;
 type JsonObject = Record<string, unknown>;
 type FailureReporter = (event: {
   operation: LatchfloFailureOperation;

@@ -1,20 +1,20 @@
 {
   "name": "tyr-admission-controller",
-  "version": "0.35.0",
+  "version": "0.36.0",
   "private": true,
   "license": "Apache-2.0",
   "description": "Tyr is a capacity guard for LLM traffic that reserves expected token capacity before execution, sheds requests that would overcommit a model pool, and reconciles reservations from live provider usage.",
-  "homepage": "https://github.com/mofluxhq/tyr-admission-controller#readme",
+  "homepage": "https://github.com/janbalangue/tyr-admission-controller#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mofluxhq/tyr-admission-controller.git"
+    "url": "git+https://github.com/janbalangue/tyr-admission-controller.git"
   },
   "bugs": {
-    "url": "https://github.com/mofluxhq/tyr-admission-controller/issues"
+    "url": "https://github.com/janbalangue/tyr-admission-controller/issues"
   },
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -29,6 +29,7 @@
     "release:check": "npm run verify:vendor && npm run lint && npm run typecheck && npm test && npm run verify:eval && npm run verify:admission-provenance && npm run verify:admission-timing && npm run verify:routing && npm run verify:routing-topology && npm run verify:openai-responses && npm run verify:responses-state && npm run verify:admission-classes && npm run verify:borrowed-restoration && npm run verify:stop && npm run verify:demand && npm run verify:handoff && npm run verify:class-handoff && npm run verify:progressive && npm run smoke && npm pack --dry-run",
     "lint": "eslint . --max-warnings=0",
     "lint:fix": "eslint . --fix",
+    "docs": "typedoc",
     "eval": "npm run build && node eval/run.mjs",
     "eval:serve": "npm run build && node eval/run.mjs --serve",
     "verify:eval": "npm run build && node eval/run.mjs --quick --assert",
@@ -62,6 +63,7 @@
     "@types/node": "^22.0.0",
     "eslint": "^10.0.2",
     "eslint-config-prettier": "^10.1.8",
+    "typedoc": "^0.28.20",
     "typescript": "^5.6.0",
     "typescript-eslint": "^8.56.1",
     "vitest": "^4.0.0"
@@ -74,6 +76,7 @@
     "config/tyr.example.yaml",
     "config/tyr.latchflo.example.yaml",
     "config/tyr.schema.json",
+    "guides",
     "README.md",
     "CHANGELOG.md",
     "THIRD_PARTY_NOTICES.txt",
