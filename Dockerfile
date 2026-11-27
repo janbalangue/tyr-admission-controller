@@ -1,4 +1,6 @@
-FROM node:20-alpine AS build
+# The build stage emits plain JavaScript, so it runs once on the builder's own
+# platform even when the image is built for several.
+FROM --platform=$BUILDPLATFORM node:24-alpine AS build
 
 WORKDIR /app
 
@@ -11,11 +13,11 @@ COPY src ./src
 RUN npm run build
 
 
-FROM node:20-alpine AS runtime
+FROM node:24-alpine AS runtime
 
 LABEL org.opencontainers.image.title="Tyr Admission Controller" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.source="https://github.com/mofluxhq/tyr-admission-controller"
+      org.opencontainers.image.source="https://github.com/janbalangue/tyr-admission-controller"
 
 WORKDIR /app
 ENV NODE_ENV=production

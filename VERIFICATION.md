@@ -1,30 +1,93 @@
-# Tyr 0.35.0 verification
+# Tyr 0.36.0 verification
 
-Date: 2026-11-23
+Date: 2026-11-26
 
 ## Version alignment
 
-- Tyr package version: `0.35.0`
-- Runtime version constant: `0.35.0`
+- Tyr package version: `0.36.0`
+- Runtime version constant: `0.36.0`
 - Runtime dependency: `async-bulkhead-llm@3.18.0`
 - Transitive bulkhead dependency: `async-bulkhead-ts@1.0.1`
 - Vendored runtime artifacts:
   - `vendor/async-bulkhead-llm-3.18.0.tgz`
   - `vendor/async-bulkhead-ts-1.0.1.tgz`
   - `vendor/yaml-2.9.0.tgz`
-- Package repository: `https://github.com/mofluxhq/tyr-admission-controller.git`
+- Package repository: `https://github.com/janbalangue/tyr-admission-controller.git`
+- Minimum Node.js version: 22
+- Container base image: `node:24-alpine`
 
 ## Required release order
 
 `async-bulkhead-llm@3.18.0` was published to npm on 2026-11-23, and Tyr has
-vendored it since 0.34.1. 0.35.0 keeps that tarball and is the first release
-to use what 3.18.0 added. Tyr's committed lockfile
+vendored it since 0.34.1. 0.36.0 keeps that tarball. Its only changes to
+Tyr's own source are the version constant and three exported type aliases,
+described under Documentation below. Tyr's committed lockfile
 intentionally resolves the
 exact bundled `vendor/async-bulkhead-llm-3.18.0.tgz`, so the Tyr build is
 reproducible without the registry; the vendor artifact is not a substitute for
 publishing the declared public package version.
 `npm run verify:vendor-provenance` confirms the bundled tarball is
 byte-identical to the published one.
+
+## Container image (0.36.0)
+
+The image was built on the development Mac (Apple silicon) with Docker 29.8.0
+and Buildx 0.37.1, for the platforms and with the attestation settings the
+`image` CI job uses:
+
+```bash
+docker buildx build --no-cache --platform linux/amd64,linux/arm64 \
+  --sbom=true --provenance=mode=max \
+  -o type=oci,dest=tyr-0.36.0.oci.tar .
+```
+
+- The exported index holds four manifests: an image for `linux/amd64`, an
+  image for `linux/arm64`, and an attestation manifest for each.
+- Each attestation manifest carries an SPDX 2.3 SBOM and a SLSA v1 provenance
+  statement. The SBOM lists `tyr-admission-controller@0.36.0`,
+  `async-bulkhead-llm@3.18.0` and `async-bulkhead-ts@1.0.1`.
+- Both images run as the `node` user on Node.js 24.22.3, the version
+  `node:24-alpine` resolved to at build time, and carry the
+  `janbalangue/tyr-admission-controller` source label.
+- The build stage ran once, on `linux/arm64`, for both target platforms.
+- Started with `config/tyr.example.yaml` mounted read-only, the container for
+  each platform answered `GET /healthz` with `200` and reported
+  `tyr_build_info{version="0.36.0"} 1` on `/metrics`. The `linux/amd64`
+  container ran under emulation.
+
+Not verified: the `image` job on GitHub Actions, the push to the GitHub
+Container Registry, and a pulled image. GitHub's runners emulate
+`linux/arm64`, the reverse of this build. The job first runs when this release
+is pushed, and the package it creates is private until it is made public.
+
+## Documentation (0.36.0)
+
+The README's reference sections were moved into `guides/` by a script that
+copied each section and changed only its headings and links. Of the 1,444
+content lines in the 0.35.0 README, 1,428 are unchanged in the new README or a
+guide. The other 16 are the reworded opening, the two Node.js 20 statements,
+the requirements list and the pointer to the changelog and roadmap, which the
+new README states in its own sections.
+
+- `npm run docs` builds the TypeDoc site with no errors and no warnings.
+  TypeDoc's link validation covers the README and every document page and
+  reports no broken link.
+- Three type aliases that documented modules refer to were exported so the
+  API reference includes them: `Logger` in `src/latchflo.ts`, `PoolState` in
+  `src/retry-hint.ts` and `AdvisoryStats` in `src/pools.ts`. Before the
+  change the build reported one warning for each. The compiled
+  `dist/latchflo.js`, `dist/retry-hint.js` and `dist/pools.js` are
+  byte-identical before and after it; only their `.d.ts` files differ.
+- A separate check of the Markdown as GitHub renders it resolved every
+  relative link and anchor in the README, the 15 guides, `EVALUATION.md`,
+  `CONTRIBUTING.md` and `SECURITY.md`.
+- The site has a page for each guide and for `EVALUATION.md`, `ROADMAP.md`,
+  `CHANGELOG.md`, `VERIFICATION.md`, `CONTRIBUTING.md` and `SECURITY.md`, and
+  an API reference for 14 modules.
+
+Not verified: the site in a browser, the `Docs` workflow on GitHub Actions,
+and the GitHub Pages deployment. The deploy job fails until Pages is enabled
+for the repository with GitHub Actions as its source.
 
 ## Stopping admitted requests (0.35.0)
 
@@ -331,7 +394,7 @@ volume in the container image, and more than two replicas.
 `npm run verify:eval` runs the evaluation for 5 seconds per phase and passes
 only if the direct phase shows contention, every interactive request completes
 through Tyr, the provider rejects nothing behind Tyr, and Tyr rejects batch
-work. It is part of `release:check` and runs in CI on Node 20, 22, and 24.
+work. It is part of `release:check` and runs in CI on Node 22 and 24.
 
 A full `npm run eval` on the development Mac completed 12 of 188 interactive
 requests (6%) directly and 60 of 60 through Tyr. The provider rejected 1,380
@@ -466,7 +529,7 @@ still has no synchronous control-plane call.
 
 ## Carried-forward compatibility
 
-Tyr 0.35.0 retains the native Anthropic Messages, OpenAI Chat Completions, and
+Tyr 0.36.0 retains the native Anthropic Messages, OpenAI Chat Completions, and
 OpenAI Responses routes from 0.29.0. Responses requests stay stateless unless
 `responsesState` is configured. Existing identity, routing,
 managed-mode, provenance, timing, retry-hint, and progressive-reconciliation
@@ -476,7 +539,7 @@ block or `shutdown.stopOnDrainTimeout` is configured.
 
 ## Release gate
 
-From a clean dependency install on Node.js 20 or newer:
+From a clean dependency install on Node.js 22 or newer:
 
 ```bash
 npm ci
@@ -500,23 +563,26 @@ git diff --check
 
 ## Recorded results
 
-The full release gate passed on the development Mac on 2026-11-23, on Node.js
-24.18.0, in about 45 seconds:
+The full release gate passed on the development Mac on 2026-11-26, after a
+clean `npm ci` on Node.js 24.18.0. It ran on Node.js 24.18.0 in about 48
+seconds and on Node.js 22.23.1 in about 49 seconds. On each:
 
 - 22 Vitest files passed, containing 339 tests;
 - every executable verifier passed, including the seven borrowed-restoration
   assertions, `verify:responses-state` and the seven `verify:stop` assertions;
-- both shipped YAML examples passed runtime CLI validation;
-- telemetry smoke and `git diff --check` passed;
-- `npm pack --dry-run` included 53 files, approximately 177.1 kB packed and
-  731.8 kB unpacked.
+- telemetry smoke passed.
 
-`npm run verify:vendor-provenance` also passed: the three vendored artifacts
-match their published releases. The full release gate and the telemetry smoke
-also passed locally on Node.js 20.20.0 and 22.23.1, with 339 tests on each.
-The five new test files and the reconciliation tests were run 25 more times,
-the whole suite 4 more times and `verify:stop` 5 more times, without a
-failure. CI was not run for this record.
+On Node.js 24.18.0:
+
+- both shipped YAML examples passed runtime CLI validation;
+- `git diff --check` passed, and the new files have no whitespace errors;
+- `npm run verify:vendor-provenance` passed: the three vendored artifacts
+  match their published releases;
+- `npm pack --dry-run` included 68 files, approximately 182.8 kB packed and
+  746.9 kB unpacked. The 15 files in `guides/` are new to the tarball.
+
+Nothing was run on Node.js 20, which this release no longer supports. CI was
+not run for this record.
 
 The final ZIP is checked from a fresh extraction before delivery. It excludes
 platform-specific `node_modules`; consumers install the locked development

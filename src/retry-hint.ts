@@ -72,7 +72,7 @@ const HINTABLE: ReadonlySet<LLMRejectReason> = new Set<LLMRejectReason>([
   "timeout",
 ]);
 
-type PoolState = {
+export type PoolState = {
   /** EWMA of the gap between consecutive completions, in ms. */
   intervalMs: number;
   /** EWMA of tokens released per completion. */

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+
+  "entryPoints": [
+    "src/server.ts",
+    "src/config.ts",
+    "src/pools.ts",
+    "src/identity.ts",
+    "src/telemetry.ts",
+    "src/latchflo.ts",
+    "src/admission-policy.ts",
+    "src/routing.ts",
+    "src/responses-state.ts",
+    "src/retry-hint.ts",
+    "src/adapters.ts",
+    "src/demand.ts",
+    "src/upstream-failure.ts",
+    "src/sse.ts"
+  ],
+  "tsconfig": "tsconfig.build.json",
+  "out": "docs",
+
+  "name": "Tyr Admission Controller",
+  "includeVersion": true,
+  "readme": "README.md",
+  "hostedBaseUrl": "https://janbalangue.github.io/tyr-admission-controller/",
+
+  "projectDocuments": [
+    "guides/concepts.md",
+    "guides/admission-classes.md",
+    "guides/identity.md",
+    "guides/http-api.md",
+    "guides/configuration.md",
+    "guides/deployment.md",
+    "guides/streaming.md",
+    "guides/stopping-admitted-requests.md",
+    "guides/response-memory.md",
+    "guides/telemetry.md",
+    "guides/replica-routing.md",
+    "guides/latchflo.md",
+    "guides/embedding.md",
+    "guides/limitations.md",
+    "guides/development.md",
+    "EVALUATION.md",
+    "ROADMAP.md",
+    "CHANGELOG.md",
+    "VERIFICATION.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md"
+  ],
+
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "categorizeByGroup": true,
+
+  "navigationLinks": {
+    "GitHub": "https://github.com/janbalangue/tyr-admission-controller"
+  },
+
+  "validation": {
+    "notExported": true,
+    "invalidLink": true,
+    "notDocumented": false
+  }
+}

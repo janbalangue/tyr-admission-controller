@@ -8,6 +8,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-11-26
+
+### Added
+
+- A release tag publishes a container image to the GitHub Container Registry
+  at `ghcr.io/janbalangue/tyr-admission-controller`, for `linux/amd64` and
+  `linux/arm64`. The image is tagged with its exact version only; no `latest`
+  tag is published. It carries an SBOM and build provenance. 0.36.0 is the
+  first published version.
+- CI builds the image for both platforms on every run, so a Dockerfile that
+  does not build fails before a release.
+- Topical guides under `guides/` hold the reference material that was in the
+  README. A documentation site built with TypeDoc carries the guides and an
+  API reference for the modules an embedder uses. `npm run docs` builds it,
+  and a `Docs` workflow publishes it to GitHub Pages from `master`.
+
+### Changed
+
+- The minimum Node.js version is 22. Node.js 20 reached end-of-life on
+  2026-04-30. `engines` requires `>=22`, CI runs Node.js 22 and 24, and the
+  container image runs on Node.js 24.
+- The README opens with the problem Tyr addresses and is now an overview that
+  links to the guides. The reference text moved to the guides unchanged, apart
+  from its links and headings.
+- The Dockerfile's build stage runs on the builder's own platform, because its
+  output is plain JavaScript.
+- Repository links name `janbalangue/tyr-admission-controller`, where the
+  repository lives, instead of `mofluxhq/tyr-admission-controller`.
+
+### Compatibility
+
+- Tyr's own source changed in two ways: the version constant, and three type
+  aliases that are now exported so the API reference can document them. They
+  are `Logger` in `latchflo.ts`, `PoolState` in `retry-hint.ts` and
+  `AdvisoryStats` in `pools.ts`. The compiled JavaScript of those three
+  modules is unchanged. The only test change is the version string one
+  assertion expects. Configuration, the schema, routes, `/stats`, `/metrics`
+  and audit events are as in 0.35.0.
+- Node.js 20 is no longer supported. Running from source needs Node.js 22 or
+  newer.
+- Building the Dockerfile now needs BuildKit, which is Docker's default
+  builder. The legacy builder does not set `BUILDPLATFORM`.
+- Versions before 0.36.0 have no published image and are built from source.
+- The SBOM and provenance are the unsigned attestations BuildKit attaches to
+  the image. The image is not signed or scanned for vulnerabilities.
+- A link to a section of the README, such as
+  `README.md#configuration-schema`, no longer lands on that section. The
+  sections are now in `guides/`.
+- The `npm pack` tarball includes `guides/`.
+- The API reference documents TypeScript interfaces that are not yet stable.
+
 ## [0.35.0] - 2026-11-23
 
 ### Added
@@ -1648,30 +1699,30 @@ Recommended rollout:
 - Test/build configuration: excluded `dist` from the test glob and scoped the
   build output to `src` only.
 
-[Unreleased]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.30.0...HEAD
-[0.30.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.29.0...v0.30.0
-[0.29.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.28.0...v0.29.0
-[0.28.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.27.0...v0.28.0
-[0.27.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.26.0...v0.27.0
-[0.26.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.25.1...v0.26.0
-[0.25.1]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.25.0...v0.25.1
-[0.25.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.24.0...v0.25.0
-[0.24.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.23.0...v0.24.0
-[0.23.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.22.0...v0.23.0
-[0.22.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.21.0...v0.22.0
-[0.21.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.20.1...v0.21.0
-[0.20.1]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.20.0...v0.20.1
-[0.20.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.19.0...v0.20.0
-[0.19.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.18.0...v0.19.0
-[0.18.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.17.0...v0.18.0
-[0.17.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.16.0...v0.17.0
-[0.16.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.15.1...v0.16.0
-[0.7.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.6.1...v0.7.0
-[0.6.1]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.6.0...v0.6.1
-[0.6.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.5.0...v0.6.0
-[0.5.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.4.1...v0.5.0
-[0.4.1]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/mofluxhq/tyr-admission-controller/releases/tag/v0.2.0
-[0.1.0]: https://github.com/mofluxhq/tyr-admission-controller/compare/72236af...96e0097
+[Unreleased]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.30.0...HEAD
+[0.30.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.29.0...v0.30.0
+[0.29.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.28.0...v0.29.0
+[0.28.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.27.0...v0.28.0
+[0.27.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.26.0...v0.27.0
+[0.26.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.25.1...v0.26.0
+[0.25.1]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.25.0...v0.25.1
+[0.25.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.24.0...v0.25.0
+[0.24.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.23.0...v0.24.0
+[0.23.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.22.0...v0.23.0
+[0.22.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.21.0...v0.22.0
+[0.21.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.20.1...v0.21.0
+[0.20.1]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.20.0...v0.20.1
+[0.20.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.19.0...v0.20.0
+[0.19.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.18.0...v0.19.0
+[0.18.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.17.0...v0.18.0
+[0.17.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.16.0...v0.17.0
+[0.16.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.15.1...v0.16.0
+[0.7.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/janbalangue/tyr-admission-controller/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/janbalangue/tyr-admission-controller/releases/tag/v0.2.0
+[0.1.0]: https://github.com/janbalangue/tyr-admission-controller/compare/72236af...96e0097

@@ -247,7 +247,7 @@ export type AdmissionRunContext = {
   reportUsage(usage: TokenUsage): UsageReport;
 };
 
-type AdvisoryStats = {
+export type AdvisoryStats = {
   checked: number;
   wouldAdmit: number;
   wouldReject: number;

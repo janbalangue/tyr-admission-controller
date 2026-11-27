@@ -1,7 +1,7 @@
 # Evaluating Tyr
 
 A checklist for deciding whether Tyr fits your traffic. Steps 1–3 need only
-Node.js 20 or newer. None of it needs Kubernetes or Latchflo.
+Node.js 22 or newer. None of it needs Kubernetes or Latchflo.
 
 ## 1. See it protect interactive traffic (5 minutes, no API key)
 

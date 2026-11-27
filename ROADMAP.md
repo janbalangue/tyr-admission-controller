@@ -2,8 +2,8 @@
 
 Tyr is an LLM admission controller. Its purpose is to prevent concurrent AI workloads from overcommitting finite provider or inference capacity by reserving token capacity before upstream execution begins.
 
-This roadmap prioritizes the shortest path from the current `v0.35.0`
-release, which can stop admitted requests, to a commercially credible product. It
+This roadmap prioritizes the shortest path from the current `v0.36.0`
+release, the first with a published container image, to a commercially credible product. It
 assumes one experienced TypeScript/backend engineer, automated tests and
 documentation for every milestone, and no custom management UI before
 `v1.0.0`.
@@ -25,10 +25,15 @@ The initial commercial promise is:
 5. **Control cardinality.** Tenant, application, model, and request identifiers must not create unbounded metric labels or bulkhead instances.
 6. **Preserve a small data plane.** Authentication, admission, forwarding, and telemetry belong in the gateway; historical analytics and fleet coordination may live outside it.
 
-## Current baseline: v0.35.0
+## Current baseline: v0.36.0
 
 The current release provides:
 
+- A container image published to the GitHub Container Registry for
+  `linux/amd64` and `linux/arm64`, tagged with its exact version and carrying
+  an SBOM and build provenance.
+- Topical guides and a documentation site with an API reference for
+  embedders.
 - Opt-in stopping of admitted requests: a request whose token hold overruns
   its reservation, requests left above lowered limits after a grace period,
   and requests still running at the shutdown drain deadline. A stop returns
@@ -520,6 +525,23 @@ Outcome:
 - Tyr keeps its pre-upstream token-reservation guarantee explicit rather than
   pretending unseen provider-managed state can be estimated safely.
 
+### v0.36.0 — Published container image and documentation site — shipped 2026-11-26
+
+- A release tag publishes the container image to the GitHub Container Registry at `ghcr.io/janbalangue/tyr-admission-controller`, for `linux/amd64` and `linux/arm64`, tagged with its exact version and carrying an SBOM and build provenance.
+- CI builds the image for both platforms on every run, so a Dockerfile that does not build fails before a release.
+- Raised the minimum Node.js version from 20, which reached end-of-life on 2026-04-30, to 22. The image runs on Node.js 24.
+- Moved the README's reference material into topical guides under `guides/`, and added a TypeDoc documentation site with those guides and an API reference, published to GitHub Pages.
+- The README now opens with the problem Tyr addresses.
+- Repository links name `janbalangue/tyr-admission-controller`, where the repository lives.
+- No Tyr behavior changed. The source changes are the version constant and three type aliases exported for the API reference.
+
+Outcome:
+
+- An evaluator or design partner can pull a pinned image instead of cloning the repository and building one.
+- A reader can find one topic without scrolling a 1,700-line README.
+
+Not in this release: vulnerability scanning, image signing, a `latest` tag, a Docker Hub mirror, the Helm chart, and stable TypeScript interfaces.
+
 ### v0.35.0 — Stopping admitted requests — shipped 2026-11-23
 
 - Added an opt-in per-pool `stop` block. `overrunAllowanceTokens` stops a request whose token hold grows past its reservation, and `takeBackGraceMs` stops the requests a limits update left above the new limits once the grace period ends.
@@ -609,12 +631,12 @@ Outcome:
 
 ### v1.0.0 — Supported production release
 
-**Timing:** After v0.35.0 and sufficient design-partner validation.
+**Timing:** After v0.36.0 and sufficient design-partner validation.
 **Goal:** Provide a stable, documented, supportable product for production design partners.
 
 Planned work:
 
-- Publish a versioned Docker image with SBOM, provenance, vulnerability scanning, and multi-architecture builds.
+- Add vulnerability scanning and signing to the published container image. Since v0.36.0, each release publishes a versioned, multi-architecture image with an SBOM and provenance.
 - Publish a Helm chart with PodDisruptionBudget, readiness/liveness probes, graceful termination, resource guidance, and network-policy examples.
 - Define configuration compatibility and deprecation policies.
 - Stabilize public TypeScript configuration, identity, policy, telemetry, and coordination interfaces.
